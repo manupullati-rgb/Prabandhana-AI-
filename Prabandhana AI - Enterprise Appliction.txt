@@ -1,0 +1,3835 @@
+// Prabandhana AI - Enterprise Application Controller
+
+let currentActivePage = 'dashboard';
+let currentSimulationData = null;
+let dashDemandSupplyChart = null;
+let dashRiskDoughnutChart = null;
+let mainDemandSupplyChart = null;
+let liveTrackingTimer = null;
+
+// ============================================================
+// INITIALIZATION ON DOM READY
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+    initTheme();
+    initLanguage();
+    initCurrency();
+    initSimulatorControls();
+    
+    // Run baseline initial simulation so all 6 agents & recommendations have rich content immediately
+    executeInitialSimulation();
+
+    // Render Dashboard & Tracking components
+    renderTrackingWidgets();
+    initDashboardCharts();
+    initMainDemandSupplyChart();
+    startLiveTrackingSimulation();
+
+    // Event listeners for global changes
+    document.addEventListener('currencyChanged', updateFinancialDisplays);
+    document.addEventListener('languageChanged', updateLanguageDynamicDisplays);
+});
+
+// ============================================================
+// THEME MANAGEMENT (DARK / LIGHT)
+// ============================================================
+function initTheme() {
+    const savedTheme = localStorage.getItem('prabandhana_theme') || 'dark';
+    setTheme(savedTheme);
+}
+
+function toggleAppTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    setTheme(newTheme);
+}
+
+function setTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('prabandhana_theme', theme);
+
+    const toggleIcon = document.getElementById('themeToggleIcon');
+    const toggleText = document.getElementById('themeToggleText');
+    if (toggleIcon && toggleText) {
+        if (theme === 'dark') {
+            toggleIcon.textContent = '☀️';
+            toggleText.textContent = 'Light';
+        } else {
+            toggleIcon.textContent = '🌙';
+            toggleText.textContent = 'Dark';
+        }
+    }
+
+    // Refresh charts if initialized to adapt to theme colors
+    updateChartThemeColors();
+}
+
+function updateChartThemeColors() {
+    const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+    const textColor = isDark ? '#94A3B8' : '#475569';
+    const gridColor = isDark ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.06)';
+
+    [dashDemandSupplyChart, mainDemandSupplyChart].forEach(chart => {
+        if (chart && chart.options && chart.options.scales) {
+            if (chart.options.scales.x) {
+                chart.options.scales.x.ticks.color = textColor;
+                chart.options.scales.x.grid.color = gridColor;
+            }
+            if (chart.options.scales.y) {
+                chart.options.scales.y.ticks.color = textColor;
+                chart.options.scales.y.grid.color = gridColor;
+            }
+            chart.update();
+        }
+    });
+}
+
+// ============================================================
+// MULTI-LANGUAGE CONTROLS (18 LANGUAGES)
+// ============================================================
+function initLanguage() {
+    const langSelect = document.getElementById('languageSelector');
+    if (langSelect) {
+        langSelect.value = getAppLanguage();
+    }
+    setAppLanguage(getAppLanguage());
+}
+
+function handleLanguageChange(langCode) {
+    setAppLanguage(langCode);
+    showToast(`Language switched to ${SUPPORTED_LANGUAGES[langCode]?.name || langCode}`);
+}
+
+function updateLanguageDynamicDisplays() {
+    // Re-render any dynamically constructed labels if needed
+    updateFinancialDisplays();
+}
+
+// ============================================================
+// MULTI-CURRENCY CONTROLS (10 CURRENCIES)
+// ============================================================
+function initCurrency() {
+    const currSelect = document.getElementById('currencySelector');
+    if (currSelect) {
+        currSelect.value = getAppCurrency();
+    }
+    updateFinancialDisplays();
+}
+
+function handleCurrencyChange(currCode) {
+    setAppCurrency(currCode);
+    showToast(`Currency converted to ${currCode} (${CURRENCY_CONFIG[currCode]?.symbol})`);
+}
+
+function updateFinancialDisplays() {
+    // 1. Dashboard Logistics Cost KPI
+    const costKpiEl = document.getElementById('val-logistics-cost');
+    const currBadgeEl = document.getElementById('val-currency-badge');
+    if (costKpiEl) {
+        costKpiEl.textContent = formatCurrency(PRABANDHANA_DATA.kpis.logisticsCostUSD, currentCurrency, true);
+    }
+    if (currBadgeEl) {
+        currBadgeEl.textContent = `${currentCurrency} Converted`;
+    }
+
+    // 2. AI Recommendations Estimated Cost Impact
+    const recomCostEl = document.getElementById('recomCostImpactVal');
+    if (recomCostEl && currentSimulationData) {
+        const costUSD = currentSimulationData.recommendations.estimatedCostImpactUSD;
+        recomCostEl.textContent = formatCurrency(costUSD, currentCurrency);
+    }
+
+    // 3. Modal Budget Display
+    const modalBudgetEl = document.getElementById('modalBudgetVal');
+    if (modalBudgetEl && currentSimulationData) {
+        modalBudgetEl.textContent = formatCurrency(currentSimulationData.recommendations.estimatedCostImpactUSD, currentCurrency);
+    }
+}
+
+// ============================================================
+// NAVIGATION & PAGE ROUTING
+// ============================================================
+function navigateToPage(pageId) {
+    currentActivePage = pageId;
+
+    // Update Nav Buttons
+    document.querySelectorAll('.nav-tab-btn').forEach(btn => btn.classList.remove('active'));
+    const activeBtn = document.getElementById(`tab-${pageId}`);
+    if (activeBtn) activeBtn.classList.add('active');
+
+    // Update Page Views
+    document.querySelectorAll('.page-view').forEach(view => view.classList.remove('active'));
+    const activeView = document.getElementById(`page-${pageId}`);
+    if (activeView) activeView.classList.add('active');
+
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    // Chart resizing hooks
+    if (pageId === 'dashboard') {
+        if (dashDemandSupplyChart) dashDemandSupplyChart.resize();
+        if (dashRiskDoughnutChart) dashRiskDoughnutChart.resize();
+    } else if (pageId === 'analytics') {
+        if (mainDemandSupplyChart) mainDemandSupplyChart.resize();
+    }
+}
+
+// ============================================================
+// FEATURE 2: REAL-TIME TRACKING STREAM & SIMULATION
+// ============================================================
+function renderTrackingWidgets() {
+    const lt = PRABANDHANA_DATA.liveTracking;
+
+    // 1. Suppliers
+    const suppList = document.getElementById('track-list-suppliers');
+    if (suppList) {
+        suppList.innerHTML = lt.suppliers.map(s => `
+            <div class="tracking-item-row" id="track-sup-${s.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${s.name}</span>
+                    <span class="status-badge ${s.status}">${s.status}</span>
+                </div>
+                <div class="tracking-item-desc">${s.part} • ${s.region}</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>Latency: <strong style="color:var(--text-primary);">${s.latency}</strong></span>
+                    <span>Yield: <strong>${s.yield}</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // 2. Shipments
+    const shpList = document.getElementById('track-list-shipments');
+    if (shpList) {
+        shpList.innerHTML = lt.shipments.map(s => `
+            <div class="tracking-item-row" id="track-shp-${s.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${s.id} — ${s.carrier}</span>
+                    <span class="status-badge ${s.status}">${s.status}</span>
+                </div>
+                <div class="tracking-item-desc">${s.route} (${s.mode})</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>ETA: <strong style="color:var(--text-primary);">${s.eta}</strong></span>
+                    <span>Loads: <strong>${s.containers} TEU</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // 3. Warehouses
+    const whList = document.getElementById('track-list-warehouses');
+    if (whList) {
+        whList.innerHTML = lt.warehouses.map(w => `
+            <div class="tracking-item-row" id="track-wh-${w.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${w.name}</span>
+                    <span class="status-badge ${w.status}">${w.status}</span>
+                </div>
+                <div class="tracking-item-desc">${w.city} • Throughput: ${w.throughput}</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>Capacity: <strong style="color:var(--color-cyan);">${w.capacity}</strong></span>
+                    <span>State: <strong>${w.temp}</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // 4. Inventory Levels
+    const invList = document.getElementById('track-list-inventory');
+    if (invList) {
+        invList.innerHTML = lt.inventory.map(i => `
+            <div class="tracking-item-row" id="track-inv-${i.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${i.sku}</span>
+                    <span class="status-badge ${i.status}">${i.status}</span>
+                </div>
+                <div class="tracking-item-desc">${i.category} • Buffer: ${i.doi} Days DOI</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>On-Hand: <strong style="color:var(--text-primary);">${i.onHand.toLocaleString()}</strong></span>
+                    <span>Safety: <strong>${i.safetyStock.toLocaleString()}</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // 5. Production Status
+    const prdList = document.getElementById('track-list-production');
+    if (prdList) {
+        prdList.innerHTML = lt.production.map(p => `
+            <div class="tracking-item-row" id="track-prd-${p.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${p.line}</span>
+                    <span class="status-badge ${p.status}">${p.status}</span>
+                </div>
+                <div class="tracking-item-desc">${p.facility} • Takt: ${p.takt}</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>Efficiency: <strong style="color:var(--color-emerald);">${p.outputRate}</strong></span>
+                    <span>Target: <strong>${p.targetUnits} units/shift</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // 6. Logistics Status
+    const logList = document.getElementById('track-list-logistics');
+    if (logList) {
+        logList.innerHTML = lt.logistics.map(l => `
+            <div class="tracking-item-row" id="track-log-${l.id}">
+                <div class="tracking-item-header">
+                    <span class="tracking-item-title">${l.corridor}</span>
+                    <span class="status-badge ${l.status}">${l.status}</span>
+                </div>
+                <div class="tracking-item-desc">${l.congestion} • Variance: ${l.variance}</div>
+                <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-top:2px;">
+                    <span>Fuel Index: <strong>${l.fuelIndex}</strong></span>
+                    <span>Carriers: <strong>${l.carrierCount} Fleets</strong></span>
+                </div>
+            </div>
+        `).join('');
+    }
+}
+
+// Live Update Simulator (Cycles updates every 3.8s)
+function startLiveTrackingSimulation() {
+    if (liveTrackingTimer) clearInterval(liveTrackingTimer);
+
+    liveTrackingTimer = setInterval(() => {
+        const events = [
+            () => {
+                const wh = PRABANDHANA_DATA.liveTracking.warehouses[0];
+                const newCap = Math.floor(80 + Math.random() * 8);
+                wh.capacity = `${newCap}%`;
+                const el = document.getElementById(`track-wh-${wh.id}`);
+                if (el) {
+                    el.style.borderColor = 'var(--color-cyan)';
+                    setTimeout(() => el.style.borderColor = 'var(--border-subtle)', 1000);
+                }
+            },
+            () => {
+                const shp = PRABANDHANA_DATA.liveTracking.shipments[1];
+                shp.eta = `${Math.floor(4 + Math.random() * 4)} Hours`;
+                const el = document.getElementById(`track-shp-${shp.id}`);
+                if (el) {
+                    el.style.borderColor = 'var(--color-emerald)';
+                    setTimeout(() => el.style.borderColor = 'var(--border-subtle)', 1000);
+                }
+            },
+            () => {
+                const prd = PRABANDHANA_DATA.liveTracking.production[0];
+                prd.outputRate = `${(97.5 + Math.random() * 1.8).toFixed(1)}%`;
+                const el = document.getElementById(`track-prd-${prd.id}`);
+                if (el) {
+                    el.style.borderColor = 'var(--color-indigo)';
+                    setTimeout(() => el.style.borderColor = 'var(--border-subtle)', 1000);
+                }
+            }
+        ];
+
+        const randomEvent = events[Math.floor(Math.random() * events.length)];
+        randomEvent();
+        renderTrackingWidgets();
+    }, 3800);
+}
+
+// ============================================================
+// SIMULATOR FORM INITIALIZATION & RUNNER
+// ============================================================
+function initSimulatorControls() {
+    const cat = PRABANDHANA_DATA.simulationCatalog;
+
+    // Supplier Select
+    const supSelect = document.getElementById('simSelectSupplier');
+    if (supSelect) {
+        supSelect.innerHTML = cat.suppliers.map(s => `
+            <option value="${s.name}">${s.name} (${s.region})</option>
+        `).join('');
+    }
+
+    // Region Select
+    const regSelect = document.getElementById('simSelectRegion');
+    if (regSelect) {
+        regSelect.innerHTML = cat.regions.map(r => `
+            <option value="${r}">${r}</option>
+        `).join('');
+    }
+
+    // Transport Mode Select
+    const transSelect = document.getElementById('simSelectTransport');
+    if (transSelect) {
+        transSelect.innerHTML = cat.transportModes.map(m => `
+            <option value="${m}">${m}</option>
+        `).join('');
+    }
+
+    syncSimulatorProductDropdown();
+}
+
+function syncSimulatorProductDropdown() {
+    const supName = document.getElementById('simSelectSupplier')?.value;
+    const cat = PRABANDHANA_DATA.simulationCatalog;
+    const sup = cat.suppliers.find(s => s.name === supName) || cat.suppliers[0];
+
+    const prodSelect = document.getElementById('simSelectProduct');
+    if (prodSelect) {
+        prodSelect.innerHTML = cat.products.map(p => `
+            <option value="${p.name}" ${p.name === sup.defaultProduct ? 'selected' : ''}>
+                ${p.name} (Burn: ${p.dailyBurnRate}/d, Buffer: ${p.bufferDays}d)
+            </option>
+        `).join('');
+    }
+}
+
+function executeInitialSimulation() {
+    const res = executePrabandhanaAgents({
+        supplierName: "Apex Silicon Tech",
+        productName: "MCU-4800 Industrial Core",
+        region: "East Asia",
+        durationDays: 21,
+        transportMode: "Air Cargo Express"
+    });
+    currentSimulationData = res;
+    populateSimulationResults(res);
+    populateMultiAgentSystem(res);
+    populateRecommendationsPage(res);
+}
+
+function handleRunSimulation(event) {
+    event.preventDefault();
+
+    const supplierName = document.getElementById('simSelectSupplier').value;
+    const productName = document.getElementById('simSelectProduct').value;
+    const region = document.getElementById('simSelectRegion').value;
+    const durationDays = document.getElementById('simShutdownDuration').value;
+    const transportMode = document.getElementById('simSelectTransport').value;
+
+    const btn = document.getElementById('btnRunAiAnalysis');
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+    btn.innerHTML = `<span>⚙️</span> <span>Cognitive Agents Reasoning...</span>`;
+
+    setTimeout(() => {
+        const result = executePrabandhanaAgents({
+            supplierName,
+            productName,
+            region,
+            durationDays,
+            transportMode
+        });
+        currentSimulationData = result;
+
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.innerHTML = `<span>🤖</span> <span data-i18n="runAiAnalysis">${t('runAiAnalysis')}</span> <span>➔</span>`;
+
+        populateSimulationResults(result);
+        populateMultiAgentSystem(result);
+        populateRecommendationsPage(result);
+        updateFinancialDisplays();
+
+        showToast("Multi-Agent Analysis Executed Successfully!");
+    }, 850);
+}
+
+// ============================================================
+// FEATURE 4: POPULATE DISRUPTION SIMULATION RESULTS
+// ============================================================
+function populateSimulationResults(res) {
+    const r = res.recommendations;
+    const a = res.agents;
+
+    // 1. Risk Assessment
+    const riskEl = document.getElementById('simRiskAssessmentContent');
+    if (riskEl) {
+        riskEl.innerHTML = `
+            <strong>Pre-Mitigation Vulnerability:</strong> ${r.riskAssessment.overallRiskScore}<br>
+            <strong>Post-Mitigation Projected Score:</strong> <span style="color:var(--color-emerald); font-weight:700;">${r.riskAssessment.postMitigationRiskScore}</span><br>
+            <strong>Disrupted Volume:</strong> ${r.riskAssessment.disruptedUnits.toLocaleString()} Units (${r.riskAssessment.deficitUnits.toLocaleString()} Net Deficit Units).
+        `;
+    }
+
+    // 2. Impact Analysis
+    const impactEl = document.getElementById('simImpactAnalysisContent');
+    if (impactEl) {
+        impactEl.innerHTML = `
+            ${a.demandAgent.riskAnalysis}<br>
+            <span style="color:var(--color-gold); font-weight:700;">Revenue Protected: $${(r.riskAssessment.revenueProtectedUSD / 1000000).toFixed(2)}M USD.</span>
+        `;
+    }
+
+    // 3. Business Constraints
+    const constrList = document.getElementById('simConstraintsList');
+    if (constrList) {
+        constrList.innerHTML = r.businessConstraints.map(c => `<li>${c}</li>`).join('');
+    }
+
+    // 4. Recovery Plan
+    const recPlanEl = document.getElementById('simRecoveryPlanContent');
+    if (recPlanEl) {
+        recPlanEl.innerHTML = `
+            <strong>Directive:</strong> Sourcing shift to ${r.recommendedSupplier}.<br>
+            <strong>Logistics:</strong> ${r.logisticsStrategy}<br>
+            <strong>Inventory Buffer:</strong> ${r.inventoryReallocationPlan}
+        `;
+    }
+
+    // 5. Alternative Suppliers
+    const altSuppEl = document.getElementById('simAlternativeSuppliersContent');
+    if (altSuppEl) {
+        altSuppEl.innerHTML = r.alternativeSuppliers.map(alt => `
+            <div style="background:var(--bg-card); padding:6px 10px; border-radius:6px; margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
+                <span><strong>${alt.name}</strong> (${alt.country})</span>
+                <span style="font-family:var(--font-mono); color:var(--color-cyan);">${alt.reliability}% Reliability</span>
+            </div>
+        `).join('');
+    }
+
+    // 6. Estimated Recovery Duration
+    const durValEl = document.getElementById('simRecoveryDurationVal');
+    if (durValEl) {
+        durValEl.textContent = `${r.recoveryTimeDays} Days`;
+    }
+}
+
+// ============================================================
+// FEATURE 3: POPULATE MULTI-AGENT AI SYSTEM
+// ============================================================
+function populateMultiAgentSystem(res) {
+    const agents = res.agents;
+
+    // 1. Coordinator Agent (Master)
+    const coord = agents.coordinatorAgent;
+    document.getElementById('agent-conf-val-coordinator').textContent = `${coord.confidence}%`;
+    document.getElementById('agent-conf-bar-coordinator').style.width = `${coord.confidence}%`;
+    document.getElementById('agent-reasoning-coordinator').textContent = coord.reasoning;
+    document.getElementById('agent-recom-list-coordinator').innerHTML = coord.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">⚡</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+
+    // 2. Demand Agent
+    const dem = agents.demandAgent;
+    document.getElementById('agent-conf-val-demand').textContent = `${dem.confidence}%`;
+    document.getElementById('agent-conf-bar-demand').style.width = `${dem.confidence}%`;
+    document.getElementById('agent-reasoning-demand').textContent = dem.reasoning;
+    document.getElementById('agent-recom-list-demand').innerHTML = dem.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">▸</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+
+    // 3. Inventory Agent
+    const inv = agents.inventoryAgent;
+    document.getElementById('agent-conf-val-inventory').textContent = `${inv.confidence}%`;
+    document.getElementById('agent-conf-bar-inventory').style.width = `${inv.confidence}%`;
+    document.getElementById('agent-reasoning-inventory').textContent = inv.reasoning;
+    document.getElementById('agent-recom-list-inventory').innerHTML = inv.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">▸</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+
+    // 4. Supplier Risk Agent
+    const sup = agents.supplierRiskAgent;
+    document.getElementById('agent-conf-val-supplier').textContent = `${sup.confidence}%`;
+    document.getElementById('agent-conf-bar-supplier').style.width = `${sup.confidence}%`;
+    document.getElementById('agent-reasoning-supplier').textContent = sup.reasoning;
+    document.getElementById('agent-recom-list-supplier').innerHTML = sup.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">▸</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+
+    // 5. Logistics Agent
+    const log = agents.logisticsAgent;
+    document.getElementById('agent-conf-val-logistics').textContent = `${log.confidence}%`;
+    document.getElementById('agent-conf-bar-logistics').style.width = `${log.confidence}%`;
+    document.getElementById('agent-reasoning-logistics').textContent = log.reasoning;
+    document.getElementById('agent-recom-list-logistics').innerHTML = log.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">▸</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+
+    // 6. Financial Agent
+    const fin = agents.financialAgent;
+    document.getElementById('agent-conf-val-financial').textContent = `${fin.confidence}%`;
+    document.getElementById('agent-conf-bar-financial').style.width = `${fin.confidence}%`;
+    document.getElementById('agent-reasoning-financial').textContent = fin.reasoning;
+    document.getElementById('agent-recom-list-financial').innerHTML = fin.recommendations.map(r => `
+        <div class="agent-recom-bullet">
+            <span class="agent-recom-bullet-icon">▸</span>
+            <span>${r}</span>
+        </div>
+    `).join('');
+}
+
+// ============================================================
+// FEATURE 5: POPULATE AI RECOMMENDATION ENGINE
+// ============================================================
+function populateRecommendationsPage(res) {
+    const r = res.recommendations;
+
+    // Recommended Supplier
+    document.getElementById('recomSupplierTitle').textContent = r.recommendedSupplier;
+    document.getElementById('recomSupplierSub').textContent = r.recommendedSupplierDetails;
+
+    // Estimated Cost Impact (Formatted in selected currency)
+    document.getElementById('recomCostImpactVal').textContent = formatCurrency(r.estimatedCostImpactUSD, currentCurrency);
+
+    // Recovery Time
+    document.getElementById('recomRecoveryTimeVal').textContent = `${r.recoveryTimeDays} Days`;
+
+    // Confidence Level
+    document.getElementById('recomConfidenceVal').textContent = r.confidenceLevel;
+
+    // 3 Action Plans
+    document.getElementById('recomLogisticsPlanText').textContent = r.logisticsStrategy;
+    document.getElementById('recomInventoryPlanText').textContent = r.inventoryReallocationPlan;
+    document.getElementById('recomProductionPlanText').textContent = r.productionReschedulingPlan;
+
+    // Modal sync
+    document.getElementById('modalSupplierName').textContent = r.recommendedSupplier;
+    document.getElementById('modalBudgetVal').textContent = formatCurrency(r.estimatedCostImpactUSD, currentCurrency);
+    document.getElementById('modalRecoveryVal').textContent = `${r.recoveryTimeDays} Days Max`;
+}
+
+// ============================================================
+// FEATURE 6: DEMAND VS SUPPLY ANALYTICS (CHART.JS)
+// ============================================================
+function initDashboardCharts() {
+    const ctx = document.getElementById('dashDemandSupplyChart');
+    if (ctx) {
+        if (dashDemandSupplyChart) dashDemandSupplyChart.destroy();
+
+        dashDemandSupplyChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: PRABANDHANA_DATA.demandVsSupplyData.months,
+                datasets: [
+                    {
+                        label: 'Demand (Units)',
+                        data: PRABANDHANA_DATA.demandVsSupplyData.demandUnits,
+                        borderColor: '#38BDF8', // Blue line = Demand
+                        backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                        fill: true,
+                        tension: 0.35,
+                        borderWidth: 2.5
+                    },
+                    {
+                        label: 'Supply (Units)',
+                        data: PRABANDHANA_DATA.demandVsSupplyData.supplyUnits,
+                        borderColor: '#10B981', // Green line = Supply
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        fill: true,
+                        tension: 0.35,
+                        borderWidth: 2.5
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94A3B8', font: { family: 'Plus Jakarta Sans', size: 10 } } }
+                },
+                scales: {
+                    x: { ticks: { color: '#94A3B8' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { ticks: { color: '#94A3B8' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                }
+            }
+        });
+    }
+
+    const ctxDoughnut = document.getElementById('dashRiskDoughnutChart');
+    if (ctxDoughnut) {
+        if (dashRiskDoughnutChart) dashRiskDoughnutChart.destroy();
+
+        dashRiskDoughnutChart = new Chart(ctxDoughnut, {
+            type: 'doughnut',
+            data: {
+                labels: ['Maritime Port Congestion', 'Single-Source Nodes', 'Geopolitical Trade Barriers', 'Factory Energy Caps'],
+                datasets: [{
+                    data: [38, 28, 20, 14],
+                    backgroundColor: ['#06B6D4', '#EF4444', '#F59E0B', '#6366F1'],
+                    borderColor: '#0E1626',
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { position: 'bottom', labels: { color: '#94A3B8', font: { size: 10 } } }
+                },
+                cutout: '65%'
+            }
+        });
+    }
+}
+
+function initMainDemandSupplyChart() {
+    const ctx = document.getElementById('mainDemandSupplyChart');
+    if (!ctx) return;
+
+    if (mainDemandSupplyChart) mainDemandSupplyChart.destroy();
+
+    mainDemandSupplyChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: PRABANDHANA_DATA.demandVsSupplyData.months,
+            datasets: [
+                {
+                    label: 'Demand (Units) — Blue Line',
+                    data: PRABANDHANA_DATA.demandVsSupplyData.demandUnits,
+                    borderColor: '#38BDF8', // Blue line = Demand
+                    backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                    fill: false,
+                    tension: 0.35,
+                    borderWidth: 3.5,
+                    pointBackgroundColor: '#38BDF8',
+                    pointRadius: 4
+                },
+                {
+                    label: 'Supply (Units) — Green Line',
+                    data: PRABANDHANA_DATA.demandVsSupplyData.supplyUnits,
+                    borderColor: '#10B981', // Green line = Supply
+                    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                    fill: false,
+                    tension: 0.35,
+                    borderWidth: 3.5,
+                    pointBackgroundColor: '#10B981',
+                    pointRadius: 4
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { color: '#94A3B8', font: { family: 'Plus Jakarta Sans', size: 12, weight: 600 } }
+                },
+                tooltip: {
+                    backgroundColor: '#0E1626',
+                    titleColor: '#F8FAFC',
+                    bodyColor: '#94A3B8',
+                    borderColor: 'rgba(6, 182, 212, 0.4)',
+                    borderWidth: 1,
+                    callbacks: {
+                        afterBody: (context) => {
+                            const index = context[0].dataIndex;
+                            const demand = PRABANDHANA_DATA.demandVsSupplyData.demandUnits[index];
+                            const supply = PRABANDHANA_DATA.demandVsSupplyData.supplyUnits[index];
+                            if (supply < demand) {
+                                return `⚠️ Shortage Deficit: -${(demand - supply).toLocaleString()} units`;
+                            }
+                            return `✅ Surplus Buffer: +${(supply - demand).toLocaleString()} units`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    ticks: { color: '#94A3B8', font: { family: 'Plus Jakarta Sans' } },
+                    grid: { color: 'rgba(255, 255, 255, 0.05)' }
+                },
+                y: {
+                    title: { display: true, text: 'Monthly Volume (Units)', color: '#64748B' },
+                    ticks: { color: '#94A3B8' },
+                    grid: { color: 'rgba(255, 255, 255, 0.05)' }
+                }
+            }
+        }
+    });
+
+    // Populate Forecast Metrics Cards
+    const fm = PRABANDHANA_DATA.demandVsSupplyData.forecastMetrics;
+    document.getElementById('val-demand-forecast').textContent = `${fm.demandForecastUnitsNextQuarter.toLocaleString()} Units`;
+    document.getElementById('val-inv-forecast').textContent = `${fm.inventoryForecastUnitsNextQuarter.toLocaleString()} Units`;
+    document.getElementById('val-supply-forecast').textContent = `${fm.supplyForecastUnitsNextQuarter.toLocaleString()} Units`;
+}
+
+// ============================================================
+// MODAL & USER ACTIONS
+// ============================================================
+function openExecutionModal() {
+    const modal = document.getElementById('executionModal');
+    if (modal) modal.classList.add('active');
+}
+
+function closeExecutionModal() {
+    const modal = document.getElementById('executionModal');
+    if (modal) modal.classList.remove('active');
+}
+
+function confirmDispatchAction() {
+    closeExecutionModal();
+    const sup = currentSimulationData ? currentSimulationData.recommendations.recommendedSupplier : 'Kyoto Precision Semiconductor Ltd';
+    showToast(`✓ PO-88402 Dispatched to ${sup}! Priority Freight slot confirmed.`);
+}
+
+function exportExecutiveBrief() {
+    if (!currentSimulationData) return;
+
+    const brief = {
+        application: "Prabandhana AI",
+        tagline: "AI-Powered Supply Chain Resilience & Global Operations Command Center",
+        exportedAt: new Date().toISOString(),
+        selectedLanguage: currentLanguage,
+        selectedCurrency: currentCurrency,
+        kpiOverview: PRABANDHANA_DATA.kpis,
+        simulationInputs: currentSimulationData.inputs,
+        agentConsensus: currentSimulationData.recommendations.confidenceLevel,
+        executiveRecommendations: currentSimulationData.recommendations
+    };
+
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(brief, null, 2));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", `Prabandhana_AI_Executive_Brief_${Date.now()}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+
+    showToast("Downloaded Prabandhana AI Strategic Brief (JSON)");
+}
+
+// Toast Feedback Helper
+function showToast(msg) {
+    const toast = document.getElementById('appToast');
+    const msgEl = document.getElementById('toastMessage');
+    if (!toast || !msgEl) return;
+
+    msgEl.textContent = msg;
+    toast.classList.add('show');
+
+    setTimeout(() => {
+        toast.classList.remove('show');
+    }, 3800);
+}
+// Prabandhana AI - Multi-Currency Conversion Module
+// Supported Currencies: USD, INR, EUR, GBP, JPY, CNY, AED, CAD, AUD, SGD
+
+const CURRENCY_CONFIG = {
+    USD: { code: 'USD', symbol: '$', rate: 1.0, name: 'US Dollar', locale: 'en-US' },
+    INR: { code: 'INR', symbol: '₹', rate: 83.45, name: 'Indian Rupee', locale: 'en-IN' },
+    EUR: { code: 'EUR', symbol: '€', rate: 0.92, name: 'Euro', locale: 'de-DE' },
+    GBP: { code: 'GBP', symbol: '£', rate: 0.79, name: 'British Pound', locale: 'en-GB' },
+    JPY: { code: 'JPY', symbol: '¥', rate: 154.20, name: 'Japanese Yen', locale: 'ja-JP' },
+    CNY: { code: 'CNY', symbol: '¥', rate: 7.24, name: 'Chinese Yuan', locale: 'zh-CN' },
+    AED: { code: 'AED', symbol: 'د.إ', rate: 3.67, name: 'UAE Dirham', locale: 'ar-AE' },
+    CAD: { code: 'CAD', symbol: 'CA$', rate: 1.36, name: 'Canadian Dollar', locale: 'en-CA' },
+    AUD: { code: 'AUD', symbol: 'A$', rate: 1.52, name: 'Australian Dollar', locale: 'en-AU' },
+    SGD: { code: 'SGD', symbol: 'S$', rate: 1.35, name: 'Singapore Dollar', locale: 'en-SG' }
+};
+
+let currentCurrency = 'USD';
+
+function setAppCurrency(currencyCode) {
+    if (CURRENCY_CONFIG[currencyCode]) {
+        currentCurrency = currencyCode;
+        localStorage.setItem('prabandhana_currency', currencyCode);
+        document.dispatchEvent(new CustomEvent('currencyChanged', { detail: { currency: currencyCode } }));
+    }
+}
+
+function getAppCurrency() {
+    return currentCurrency;
+}
+
+function convertFromUSD(amountUSD, targetCurrency = currentCurrency) {
+    const config = CURRENCY_CONFIG[targetCurrency] || CURRENCY_CONFIG.USD;
+    return amountUSD * config.rate;
+}
+
+function formatCurrency(amountUSD, targetCurrency = currentCurrency, compact = false) {
+    const config = CURRENCY_CONFIG[targetCurrency] || CURRENCY_CONFIG.USD;
+    const converted = amountUSD * config.rate;
+
+    if (compact) {
+        if (Math.abs(converted) >= 1000000000) {
+            return `${config.symbol}${(converted / 1000000000).toFixed(2)}B`;
+        }
+        if (Math.abs(converted) >= 1000000) {
+            return `${config.symbol}${(converted / 1000000).toFixed(2)}M`;
+        }
+        if (Math.abs(converted) >= 1000) {
+            return `${config.symbol}${(converted / 1000).toFixed(1)}K`;
+        }
+    }
+
+    // Standard formatting
+    const decimals = (config.code === 'JPY') ? 0 : 2;
+    try {
+        return new Intl.NumberFormat(config.locale, {
+            style: 'currency',
+            currency: config.code,
+            maximumFractionDigits: decimals,
+            minimumFractionDigits: decimals
+        }).format(converted);
+    } catch (e) {
+        return `${config.symbol}${converted.toLocaleString(undefined, { maximumFractionDigits: decimals })}`;
+    }
+}
+
+// Initialize saved preference
+const savedCurrency = localStorage.getItem('prabandhana_currency');
+if (savedCurrency && CURRENCY_CONFIG[savedCurrency]) {
+    currentCurrency = savedCurrency;
+}
+// Prabandhana AI - Enterprise Data Models & Simulation Engines
+
+const PRABANDHANA_DATA = {
+    // 1. Dashboard 8 Core KPIs (values stored in base USD where financial)
+    kpis: {
+        totalSuppliers: 248,
+        activeOrders: 1842,
+        inventoryHealth: 88.5, // %
+        fulfillmentRate: 96.2, // %
+        atRiskSuppliers: 12,
+        riskScore: 24.8, // out of 100 (Lower is safer)
+        recoveryTimeDays: 4.2, // days
+        logisticsCostUSD: 4280000 // $4.28M USD
+    },
+
+    // 2. Real-Time Tracking Data Entities
+    liveTracking: {
+        suppliers: [
+            { id: "s-1", name: "Apex Silicon Tech", region: "East Asia (Taiwan)", part: "MCU-4800 Processors", status: "critical", latency: "+14d delay", yield: "78%" },
+            { id: "s-2", name: "Nordic Energy Systems", region: "Europe (Sweden)", part: "NMC-811 Battery Modules", status: "warning", latency: "+4d delay", yield: "94%" },
+            { id: "s-3", name: "Bharat Forge & Alloys", region: "South Asia (India)", part: "Forged Crankshaft Assemblies", status: "normal", latency: "On Schedule", yield: "99.4%" },
+            { id: "s-4", name: "Allegheny Precision Metals", region: "North America (USA)", part: "Aerospace Titanium Billets", status: "normal", latency: "On Schedule", yield: "98.9%" },
+            { id: "s-5", name: "Osaka Opto-Sensors Ltd", region: "East Asia (Japan)", part: "Solid-State LiDAR Arrays", status: "warning", latency: "+3d delay", yield: "91%" },
+            { id: "s-6", name: "Bavaria Power Dynamics", region: "Europe (Germany)", part: "SiC Inverter Modules", status: "normal", latency: "On Schedule", yield: "99.1%" }
+        ],
+        shipments: [
+            { id: "SHP-8821", carrier: "Maersk Horizon", route: "Kaohsiung ➔ Los Angeles", mode: "Ocean Freight", eta: "4 Days (Delayed)", containers: 42, status: "critical" },
+            { id: "SHP-9104", carrier: "Lufthansa Cargo Flight 782", route: "Frankfurt ➔ Chicago O'Hare", mode: "Air Cargo", eta: "6 Hours", containers: 4, status: "normal" },
+            { id: "SHP-6420", carrier: "BNSF Rail Intermodal 44", route: "Seattle ➔ Detroit Hub", mode: "Rail Intermodal", eta: "18 Hours", containers: 28, status: "normal" },
+            { id: "SHP-7731", carrier: "Singapore Airlines Cargo", route: "Changi ➔ Dallas", mode: "Air Cargo", eta: "14 Hours (Customs)", containers: 6, status: "warning" },
+            { id: "SHP-5590", carrier: "CMA CGM Palais", route: "Rotterdam ➔ New York", mode: "Ocean Freight", eta: "2 Days", containers: 36, status: "normal" },
+            { id: "SHP-3312", carrier: "Dedicated Fleet Logistics", route: "Monterrey ➔ Austin Facility", mode: "Road Freight", eta: "8 Hours", containers: 8, status: "normal" }
+        ],
+        warehouses: [
+            { id: "WH-CHI", name: "North America Central Hub", city: "Chicago, USA", capacity: "84%", throughput: "14,200 units/day", temp: "Optimal", status: "normal" },
+            { id: "WH-RTM", name: "European Gateway Terminal", city: "Rotterdam, Netherlands", capacity: "92%", throughput: "11,800 units/day", temp: "Optimal", status: "warning" },
+            { id: "WH-SGP", name: "Asia-Pacific Regional Depository", city: "Singapore", capacity: "76%", throughput: "9,400 units/day", temp: "Optimal", status: "normal" },
+            { id: "WH-BLR", name: "South Asia Tech Distribution", city: "Bangalore, India", capacity: "71%", throughput: "8,900 units/day", temp: "Optimal", status: "normal" },
+            { id: "WH-DET", name: "Detroit Fast-Turn Buffer Depot", city: "Detroit, USA", capacity: "96%", throughput: "16,500 units/day", temp: "Congested", status: "critical" }
+        ],
+        inventory: [
+            { id: "INV-101", sku: "MCU-4800 Industrial Core", category: "Semiconductors", onHand: 8400, safetyStock: 12000, doi: 14, status: "critical" },
+            { id: "INV-102", sku: "NMC-811 2170 Cell Modules", category: "Energy Storage", onHand: 24500, safetyStock: 20000, doi: 22, status: "warning" },
+            { id: "INV-103", sku: "Grade-5 Titanium Billets", category: "Alloys & Forging", onHand: 5400, safetyStock: 4000, doi: 38, status: "normal" },
+            { id: "INV-104", sku: "1200V SiC Power Inverter", category: "Power Electronics", onHand: 9200, safetyStock: 8000, doi: 29, status: "normal" },
+            { id: "INV-105", sku: "LiDAR Matrix Core CMOS", category: "Autonomy Sensors", onHand: 3100, safetyStock: 5000, doi: 16, status: "critical" },
+            { id: "INV-106", sku: "Precision Hydraulic Actuators", category: "Mechanical", onHand: 14800, safetyStock: 10000, doi: 44, status: "normal" }
+        ],
+        production: [
+            { id: "PRD-A", line: "Assembly Line A (EV Powertrain)", facility: "Plant 1", takt: "48 sec", outputRate: "98.2%", targetUnits: 800, status: "normal" },
+            { id: "PRD-B", line: "Assembly Line B (Chassis Integration)", facility: "Plant 1", takt: "62 sec", outputRate: "94.0%", targetUnits: 650, status: "normal" },
+            { id: "PRD-C", line: "Assembly Line C (Electronics & ADAS)", facility: "Plant 2", takt: "95 sec", outputRate: "72.4%", targetUnits: 450, status: "critical" },
+            { id: "PRD-D", line: "Assembly Line D (Final Testing & QA)", facility: "Plant 2", takt: "54 sec", outputRate: "91.8%", targetUnits: 720, status: "warning" }
+        ],
+        logistics: [
+            { id: "LOG-TP", corridor: "Trans-Pacific Maritime Route", carrierCount: 8, congestion: "High (Port Delays)", variance: "+5.2 Days", fuelIndex: "124.5", status: "critical" },
+            { id: "LOG-NA", corridor: "North American Rail & Intermodal", carrierCount: 14, congestion: "Low", variance: "+0.4 Days", fuelIndex: "108.2", status: "normal" },
+            { id: "LOG-EU", corridor: "Trans-Atlantic Air Cargo Express", carrierCount: 6, congestion: "Moderate", variance: "+0.8 Days", fuelIndex: "116.0", status: "normal" },
+            { id: "LOG-AS", corridor: "Southeast Asia Feeder Lanes", carrierCount: 11, congestion: "Moderate", variance: "+2.1 Days", fuelIndex: "119.4", status: "warning" }
+        ]
+    },
+
+    // 3. Disruption Simulation Catalog (Suppliers, Products, Regions, Transport Modes)
+    simulationCatalog: {
+        suppliers: [
+            { id: "sup-apex", name: "Apex Silicon Tech", region: "East Asia", defaultProduct: "MCU-4800 Industrial Core", reliability: 96.2, unitCostUSD: 45 },
+            { id: "sup-nordic", name: "Nordic Energy Systems", region: "Europe", defaultProduct: "NMC-811 2170 Cell Modules", reliability: 94.8, unitCostUSD: 120 },
+            { id: "sup-bharat", name: "Bharat Forge & Alloys", region: "South Asia", defaultProduct: "Forged Crankshaft Assemblies", reliability: 98.4, unitCostUSD: 280 },
+            { id: "sup-allegheny", name: "Allegheny Precision Metals", region: "North America", defaultProduct: "Grade-5 Titanium Billets", reliability: 98.9, unitCostUSD: 310 },
+            { id: "sup-osaka", name: "Osaka Opto-Sensors Ltd", region: "East Asia", defaultProduct: "LiDAR Matrix Core CMOS", reliability: 92.4, unitCostUSD: 240 },
+            { id: "sup-bavaria", name: "Bavaria Power Dynamics", region: "Europe", defaultProduct: "1200V SiC Power Inverter", reliability: 99.1, unitCostUSD: 195 }
+        ],
+        products: [
+            { id: "p-mcu", name: "MCU-4800 Industrial Core", category: "Semiconductors", dailyBurnRate: 500, bufferDays: 14, unitCostUSD: 45 },
+            { id: "p-cell", name: "NMC-811 2170 Cell Modules", category: "Energy Storage", dailyBurnRate: 1100, bufferDays: 22, unitCostUSD: 120 },
+            { id: "p-crank", name: "Forged Crankshaft Assemblies", category: "Mechanical", dailyBurnRate: 180, bufferDays: 35, unitCostUSD: 280 },
+            { id: "p-ti", name: "Grade-5 Titanium Billets", category: "Alloys & Forging", dailyBurnRate: 140, bufferDays: 38, unitCostUSD: 310 },
+            { id: "p-lidar", name: "LiDAR Matrix Core CMOS", category: "Autonomy Sensors", dailyBurnRate: 200, bufferDays: 16, unitCostUSD: 240 },
+            { id: "p-sic", name: "1200V SiC Power Inverter", category: "Power Electronics", dailyBurnRate: 320, bufferDays: 29, unitCostUSD: 195 }
+        ],
+        regions: ["East Asia", "Europe", "North America", "South Asia", "Southeast Asia", "Middle East"],
+        transportModes: ["Air Cargo Express", "Ocean Freight Container", "Rail Intermodal", "Dedicated Road Fleet"]
+    },
+
+    // 4. Pre-vetted Alternative Suppliers for Recovery Engine
+    alternativeSuppliers: [
+        { id: "alt-kyoto", name: "Kyoto Precision Semiconductor Ltd", country: "Japan", toolingValidated: true, capacityMonthly: 40000, costMultiplier: 1.06, leadTimeAirDays: 3, leadTimeSeaDays: 14, reliability: 99.2 },
+        { id: "alt-korea", name: "Seoul Electronics Fab Corp", country: "South Korea", toolingValidated: true, capacityMonthly: 32000, costMultiplier: 1.09, leadTimeAirDays: 4, leadTimeSeaDays: 16, reliability: 97.5 },
+        { id: "alt-austin", name: "Texas Foundry Systems", country: "USA", toolingValidated: true, capacityMonthly: 25000, costMultiplier: 1.12, leadTimeAirDays: 2, leadTimeSeaDays: 5, reliability: 98.8 },
+        { id: "alt-munich", name: "Bavaria MicroLogic Backup Line", country: "Germany", toolingValidated: false, capacityMonthly: 18000, costMultiplier: 1.15, leadTimeAirDays: 4, leadTimeSeaDays: 18, reliability: 96.0 }
+    ],
+
+    // 5. Demand vs Supply 12-Month Trend Analytics (Monthly data with forecasted supply deficit)
+    demandVsSupplyData: {
+        months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        demandUnits: [18000, 19200, 20500, 21800, 22400, 23900, 24500, 25800, 27400, 28900, 30200, 31500],
+        // Supply drops below demand in Sep, Oct, Nov due to forecasted seasonal bottlenecks
+        supplyUnits: [18500, 19800, 21000, 22200, 22800, 24100, 24800, 25400, 23800, 24200, 26000, 32000],
+        forecastMetrics: {
+            demandGrowthRate: "+18.4% YoY",
+            inventoryRunwayAvg: "26.4 Days",
+            supplyDeficitPeakMonth: "October",
+            maxDeficitUnits: 4700, // 28900 - 24200
+            estimatedDeficitValueUSD: 2350000,
+            demandForecastUnitsNextQuarter: 86500,
+            inventoryForecastUnitsNextQuarter: 48200,
+            supplyForecastUnitsNextQuarter: 74000
+        }
+    }
+};
+
+// MULTI-AGENT REASONING & RECOVERY ENGINE
+function executePrabandhanaAgents({ supplierName, productName, region, durationDays, transportMode }) {
+    const duration = parseInt(durationDays, 10);
+    const prod = PRABANDHANA_DATA.simulationCatalog.products.find(p => p.name === productName) || PRABANDHANA_DATA.simulationCatalog.products[0];
+    const sup = PRABANDHANA_DATA.simulationCatalog.suppliers.find(s => s.name === supplierName) || PRABANDHANA_DATA.simulationCatalog.suppliers[0];
+
+    const dailyBurn = prod.dailyBurnRate;
+    const totalRequiredUnits = dailyBurn * duration;
+    const bufferDays = prod.bufferDays;
+    const deficitDays = Math.max(0, duration - bufferDays);
+    const deficitUnits = deficitDays * dailyBurn;
+    const directComponentLossUSD = deficitUnits * prod.unitCostUSD;
+    const assemblyRevenueAtRiskUSD = directComponentLossUSD * 4.2;
+
+    // 1. Demand Agent
+    const demandAgent = {
+        name: "Demand Agent",
+        role: "Production Consumption & Order Commitment Predictor",
+        avatar: "📈",
+        confidence: 96.5,
+        riskLevel: deficitDays > 0 ? "High" : "Low",
+        recommendations: [
+            `Throttle Assembly Line C intake by 12% to preserve on-hand buffer units.`,
+            `Prioritize Q3 OEM contractual commitments (Batch 408 & 412) over internal aftermarket reserves.`,
+            `Activate customer delay notification window (+3.5 days allowed under SLA clause 4.2).`
+        ],
+        riskAnalysis: `Downstream manufacturing burn-rate is ${dailyBurn.toLocaleString()} units/day. A ${duration}-day disruption triggers unsupplied demand of ${totalRequiredUnits.toLocaleString()} units, placing $${(assemblyRevenueAtRiskUSD / 1000000).toFixed(2)}M downstream revenue at risk.`,
+        reasoning: `Analysis of historical order backlog reveals rigid OEM penalties if delays exceed 5 days. Since current safety stock absorbs ${bufferDays} days, actionable deficit begins strictly on Day ${bufferDays + 1}.`
+    };
+
+    // 2. Inventory Agent
+    const inventoryAgent = {
+        name: "Inventory Agent",
+        role: "Global Warehouse Safety Stock & Runout Specialist",
+        avatar: "📦",
+        confidence: 98.2,
+        riskLevel: deficitDays > 0 ? "Critical" : "Normal",
+        recommendations: [
+            `Initiate emergency inter-warehouse transfer of 2,200 units from Chicago Central Hub to Detroit Plant.`,
+            `Draw down safety stock buffer threshold from 20% to 8% across Plant 1 & 2 for 14 days.`,
+            `Reserve immediate warehouse slot in Rotterdam to stage incoming alternative shipments.`
+        ],
+        riskAnalysis: `Current warehouse runway provides ${bufferDays} days of buffer. Unmitigated shutdown exhausts all safety stocks on Day ${bufferDays}, causing a net shortage of ${deficitUnits.toLocaleString()} units.`,
+        reasoning: `Staging inter-depot buffer transfer immediately extends operational runway by +4.4 days, giving alternative procurement sufficient window to arrive before any line halt occurs.`
+    };
+
+    // 3. Supplier Risk Agent
+    const topAlt = PRABANDHANA_DATA.alternativeSuppliers[0];
+    const secondAlt = PRABANDHANA_DATA.alternativeSuppliers[1];
+    const supplierRiskAgent = {
+        name: "Supplier Risk Agent",
+        role: "Secondary Sourcing Qualification & Geo-Vulnerability Auditor",
+        avatar: "🛡️",
+        confidence: 95.8,
+        riskLevel: "Medium",
+        recommendations: [
+            `Qualify and split replenishment order: 70% allocation to ${topAlt.name} (${topAlt.country}) and 30% to ${secondAlt.name}.`,
+            `Audit geopolitical transit corridor in East Asia and establish dual-sourcing framework.`,
+            `Issue immediate Pre-Qualified PO for ${deficitUnits > 0 ? deficitUnits.toLocaleString() : "3,500"} units.`
+        ],
+        riskAnalysis: `Primary supplier ${supplierName} flagged with regional vulnerability index 74/100 in ${region}. Pre-qualified backup ${topAlt.name} has 100% tooling validation, ${topAlt.reliability}% reliability, and available capacity of ${topAlt.capacityMonthly.toLocaleString()} units/mo.`,
+        reasoning: `Switching to ${topAlt.name} incurs a minimal +6% unit cost premium while eliminating single-point-of-failure risk and guaranteeing immediate tooling ramp.`
+    };
+
+    // 4. Logistics Agent
+    const airTransitDays = 3;
+    const seaTransitDays = 14;
+    const airFreightCostUSD = (deficitUnits > 0 ? deficitUnits : 2500) * 5.20;
+    const seaFreightCostUSD = (deficitUnits > 0 ? deficitUnits : 2500) * 1.40;
+    const logisticsAgent = {
+        name: "Logistics Agent",
+        role: "Multimodal Routing, Port Clearance & Freight Optimization",
+        avatar: "✈️",
+        confidence: 97.4,
+        riskLevel: transportMode.includes("Ocean") ? "High" : "Low",
+        recommendations: [
+            `Book Air Cargo Express charter for Phase 1 batch (${Math.round((deficitUnits || 3000) * 0.4).toLocaleString()} units, 3-day transit).`,
+            `Consolidate remaining balance (${Math.round((deficitUnits || 3000) * 0.6).toLocaleString()} units) via expedited ocean freight.`,
+            `Pre-clear customs via Green-Channel e-manifest at destination airport.`
+        ],
+        riskAnalysis: `Chosen mode "${transportMode}" variance: Air Cargo delivers in 3 days vs Ocean Freight in 14 days. Ocean freight route currently experiences +4.2 days port congestion at West Coast ports.`,
+        reasoning: `Deploying a hybrid Air/Ocean strategy balances emergency line availability with logistics expense, reducing freight outlay by 44% compared to full air charter.`
+    };
+
+    // 5. Financial Agent
+    const totalAdditionalCostUSD = Math.round(airFreightCostUSD + (deficitUnits * prod.unitCostUSD * 0.06));
+    const netSavingsUSD = Math.max(0, assemblyRevenueAtRiskUSD - totalAdditionalCostUSD);
+    const financialAgent = {
+        name: "Financial Agent",
+        role: "Cost-Benefit Synthesis, Margin Protection & Working Capital",
+        avatar: "💰",
+        confidence: 96.0,
+        riskLevel: "Low",
+        recommendations: [
+            `Approve emergency procurement expenditure of $${totalAdditionalCostUSD.toLocaleString()} USD from contingency budget.`,
+            `Protect assembly production value of $${(assemblyRevenueAtRiskUSD / 1000000).toFixed(2)}M, resulting in net loss prevention of $${(netSavingsUSD / 1000000).toFixed(2)}M.`,
+            `Hedge FX exposure for JPY/EUR transactions to preserve 14.8% operating margin.`
+        ],
+        riskAnalysis: `Emergency mitigation cost is $${totalAdditionalCostUSD.toLocaleString()} USD, representing only ${(assemblyRevenueAtRiskUSD > 0 ? ((totalAdditionalCostUSD / assemblyRevenueAtRiskUSD) * 100).toFixed(1) : 1.8)}% of total revenue at risk. ROI of mitigation action is ${(assemblyRevenueAtRiskUSD > 0 ? (netSavingsUSD / totalAdditionalCostUSD).toFixed(1) : 42)}x.`,
+        reasoning: `The financial cost of doing nothing exceeds mitigation cost by two orders of magnitude. The financial model strongly authorizes immediate expenditure.`
+    };
+
+    // 6. Coordinator Agent (Combines all agents into final Master Strategy)
+    const overallConfidence = ((demandAgent.confidence + inventoryAgent.confidence + supplierRiskAgent.confidence + logisticsAgent.confidence + financialAgent.confidence) / 5).toFixed(1);
+    const recoveryDays = deficitDays > 0 ? 3.5 : 0.5;
+
+    const coordinatorAgent = {
+        name: "Coordinator Agent",
+        role: "Master Multi-Agent Orchestrator & Autonomous Strategy Synthesizer",
+        avatar: "⚡",
+        confidence: parseFloat(overallConfidence),
+        riskLevel: "Resolved",
+        recommendations: [
+            `DIRECTIVE 1: Issue Emergency PO to ${topAlt.name} for ${deficitUnits > 0 ? deficitUnits.toLocaleString() : "3,500"} units of ${productName}.`,
+            `DIRECTIVE 2: Secure Air Cargo Express booking with Osaka/Nagoya cargo hub for delivery within 72 hours.`,
+            `DIRECTIVE 3: Reallocate 2,200 buffer units from Chicago Hub to Detroit Plant to prevent any line stoppage.`,
+            `DIRECTIVE 4: Reschedule Plant Line C shift velocity to 88% takt rate for 10 days until inventory equilibrium restores.`
+        ],
+        riskAnalysis: `Multi-agent consensus achieved with ${overallConfidence}% confidence. Unmitigated shutdown of ${duration} days successfully compressed into a manageable ${recoveryDays}-day phased buffer adjustment with zero plant downtime.`,
+        reasoning: `Orchestrator synthesized trade-offs between Demand SLA constraints, Warehouse runout timelines, Supplier qualification readiness, Logistics transit speeds, and Financial return to generate the Pareto-optimal mitigation strategy.`
+    };
+
+    // Synthesized Final Recommendation Data
+    const recommendations = {
+        recommendedSupplier: topAlt.name,
+        recommendedSupplierDetails: `${topAlt.country} • Tooling Validated • ${topAlt.reliability}% Reliability`,
+        estimatedCostImpactUSD: totalAdditionalCostUSD,
+        recoveryTimeDays: recoveryDays,
+        confidenceLevel: `${overallConfidence}%`,
+        logisticsStrategy: `Hybrid Air/Ocean Freight: 40% express air delivery via ${topAlt.country} in 3 days; 60% ocean consolidation in 14 days.`,
+        inventoryReallocationPlan: `Transfer 2,200 units from Chicago Central Hub to Detroit Plant; reduce buffer threshold temporarily to 8%.`,
+        productionReschedulingPlan: `Pace Assembly Line C to 88% takt speed across 10 days; prioritize OEM batches 408 & 412; zero assembly shutdowns.`,
+        alternativeSuppliers: [topAlt, secondAlt, PRABANDHANA_DATA.alternativeSuppliers[2]],
+        businessConstraints: [
+            `Customer SLA penalty threshold: 5.0 Days (Projected delay is ${recoveryDays} Days - SLA Compliant)`,
+            `Maximum allowable expedited freight budget: $150,000 USD (Actual impact: $${totalAdditionalCostUSD.toLocaleString()} USD)`,
+            `Tooling compatibility requirement: ISO/TS 16949 certified (Met by ${topAlt.name})`
+        ],
+        riskAssessment: {
+            overallRiskScore: deficitDays > 0 ? "72 / 100 (High Prior to AI Mitigation)" : "28 / 100 (Low)",
+            postMitigationRiskScore: "14 / 100 (Safe)",
+            disruptedUnits: totalRequiredUnits,
+            deficitUnits: deficitUnits,
+            revenueProtectedUSD: assemblyRevenueAtRiskUSD
+        }
+    };
+
+    return {
+        inputs: { supplierName, productName, region, durationDays: duration, transportMode },
+        agents: {
+            demandAgent,
+            inventoryAgent,
+            supplierRiskAgent,
+            logisticsAgent,
+            financialAgent,
+            coordinatorAgent
+        },
+        recommendations
+    };
+}
+// Prabandhana AI - Multi-Language Internationalization (i18n) Module
+// Supported Languages: 18 Languages
+// English, Telugu, Hindi, Tamil, Kannada, Malayalam, Marathi, Bengali, Gujarati, Punjabi,
+// Spanish, French, German, Chinese, Japanese, Arabic, Russian, Portuguese
+
+const SUPPORTED_LANGUAGES = {
+    en: { name: 'English', native: 'English', dir: 'ltr' },
+    te: { name: 'Telugu', native: 'తెలుగు', dir: 'ltr' },
+    hi: { name: 'Hindi', native: 'हिन्दी', dir: 'ltr' },
+    ta: { name: 'Tamil', native: 'தமிழ்', dir: 'ltr' },
+    kn: { name: 'Kannada', native: 'ಕನ್ನಡ', dir: 'ltr' },
+    ml: { name: 'Malayalam', native: 'മലയാളം', dir: 'ltr' },
+    mr: { name: 'Marathi', native: 'मराठी', dir: 'ltr' },
+    bn: { name: 'Bengali', native: 'বাংলা', dir: 'ltr' },
+    gu: { name: 'Gujarati', native: 'ગુજરાતી', dir: 'ltr' },
+    pa: { name: 'Punjabi', native: 'ਪੰਜਾਬੀ', dir: 'ltr' },
+    es: { name: 'Spanish', native: 'Español', dir: 'ltr' },
+    fr: { name: 'French', native: 'Français', dir: 'ltr' },
+    de: { name: 'German', native: 'Deutsch', dir: 'ltr' },
+    zh: { name: 'Chinese', native: '中文', dir: 'ltr' },
+    ja: { name: 'Japanese', native: '日本語', dir: 'ltr' },
+    ar: { name: 'Arabic', native: 'العربية', dir: 'rtl' },
+    ru: { name: 'Russian', native: 'Русский', dir: 'ltr' },
+    pt: { name: 'Portuguese', native: 'Português', dir: 'ltr' }
+};
+
+const TRANSLATIONS = {
+    en: {
+        appName: "Prabandhana AI",
+        tagline: "AI-Powered Supply Chain Resilience & Global Operations Command Center",
+        navDashboard: "Dashboard",
+        navTracking: "Real-Time Tracking",
+        navAgents: "Multi-Agent AI",
+        navSimulator: "Disruption Simulator",
+        navRecommendations: "AI Recommendations",
+        navAnalytics: "Demand vs Supply",
+        totalSuppliers: "Total Suppliers",
+        activeOrders: "Active Orders",
+        inventoryHealth: "Inventory Health",
+        fulfillmentRate: "Fulfillment Rate",
+        atRiskSuppliers: "At-Risk Suppliers",
+        riskScore: "Supply Chain Risk Score",
+        recoveryTime: "Recovery Time Estimate",
+        logisticsCost: "Total Logistics Cost",
+        runAiAnalysis: "Run AI Analysis",
+        normal: "Normal",
+        warning: "Warning",
+        critical: "Critical",
+        supplierStatus: "Supplier Status",
+        shipmentTracking: "Shipment Tracking",
+        warehouseStatus: "Warehouse Status",
+        inventoryLevels: "Inventory Levels",
+        productionStatus: "Production Status",
+        logisticsStatus: "Logistics Status",
+        supplyShortagePredicted: "Supply Shortage Predicted",
+        demandForecast: "Demand Forecast",
+        inventoryForecast: "Inventory Forecast",
+        supplyForecast: "Supply Forecast",
+        demandVsSupplyTitle: "Demand vs Supply Trend Analysis",
+        demandLine: "Demand (Units)",
+        supplyLine: "Supply (Units)",
+        recommendedSupplier: "Recommended Supplier",
+        estimatedCostImpact: "Estimated Cost Impact",
+        confidenceLevel: "Confidence Level",
+        logisticsStrategy: "Logistics Strategy",
+        inventoryPlan: "Inventory Reallocation Plan",
+        productionPlan: "Production Rescheduling Plan",
+        liveUpdatesActive: "Live Telemetry Active",
+        switchTheme: "Toggle Theme"
+    },
+    te: {
+        appName: "ప్రబంధన AI",
+        tagline: "AI-ఆధారిత సరఫరా గొలుసు స్థితిస్థాపకత & ప్రపంచ కార్యకలాపాల కమాండ్ సెంటర్",
+        navDashboard: "డాష్‌బోర్డ్",
+        navTracking: "రియల్-టైమ్ ట్రాకింగ్",
+        navAgents: "మల్టీ-ఏజెంట్ AI",
+        navSimulator: "అంతరాయ సిమ్యులేటర్",
+        navRecommendations: "AI సిఫార్సులు",
+        navAnalytics: "డిమాండ్ vs సరఫరా",
+        totalSuppliers: "మొత్తం సరఫరాదారులు",
+        activeOrders: "క్రియాశీల ఆర్డర్లు",
+        inventoryHealth: "ఇన్వెంటరీ ఆరోగ్యం",
+        fulfillmentRate: "ఆర్డర్ నెరవేర్పు రేటు",
+        atRiskSuppliers: "ప్రమాదంలో ఉన్న సరఫరాదారులు",
+        riskScore: "సరఫరా గొలుసు ప్రమాద స్కోరు",
+        recoveryTime: "పునరుద్ధరణ సమయం అంచనా",
+        logisticsCost: "మొత్తం లాజిస్టిక్స్ ఖర్చు",
+        runAiAnalysis: "AI విశ్లేషణను ప్రారంభించండి",
+        normal: "సాధారణం",
+        warning: "హెచ్చరిక",
+        critical: "క్లిష్టమైనది",
+        supplierStatus: "సరఫరాదారు స్థితి",
+        shipmentTracking: "రవాణా ట్రాకింగ్",
+        warehouseStatus: "గిడ్డంగి స్థితి",
+        inventoryLevels: "ఇన్వెంటరీ స్థాయిలు",
+        productionStatus: "ఉత్పత్తి స్థితి",
+        logisticsStatus: "లాజిస్టిక్స్ స్థితి",
+        supplyShortagePredicted: "సరఫరా కొరత ఊహించబడింది",
+        demandForecast: "డిమాండ్ సూచన",
+        inventoryForecast: "ఇన్వెంటరీ సూచన",
+        supplyForecast: "సరఫరా సూచన",
+        demandVsSupplyTitle: "డిమాండ్ vs సరఫరా ధోరణి విశ్లేషణ",
+        demandLine: "డిమాండ్ (యూనిట్లు)",
+        supplyLine: "సరఫరా (యూనిట్లు)",
+        recommendedSupplier: "సిఫార్సు చేయబడిన సరఫరాదారు",
+        estimatedCostImpact: "అంచనా వేసిన వ్యయ ప్రభావం",
+        confidenceLevel: "విశ్వసనీయత స్థాయి",
+        logisticsStrategy: "లాజిస్టిక్స్ వ్యూహం",
+        inventoryPlan: "ఇన్వెంటరీ పునఃపంపిణీ ప్రణాళిక",
+        productionPlan: "ఉత్పత్తి రీషెడ్యూలింగ్ ప్రణాళిక",
+        liveUpdatesActive: "లైవ్ టెలిమెట్రీ క్రియాశీలంగా ఉంది",
+        switchTheme: "థీమ్ మార్చండి"
+    },
+    hi: {
+        appName: "प्रबंधना AI",
+        tagline: "एआई-संचालित सप्लाई चेन लचीलापन और वैश्विक संचालन कमांड सेंटर",
+        navDashboard: "डैशबोर्ड",
+        navTracking: "रीयल-टाइम ट्रैकिंग",
+        navAgents: "मल्टी-एजेंट एआई",
+        navSimulator: "व्यवधान सिम्युलेटर",
+        navRecommendations: "एआई सिफारिशें",
+        navAnalytics: "मांग बनाम आपूर्ति",
+        totalSuppliers: "कुल आपूर्तिकर्ता",
+        activeOrders: "सक्रिय ऑर्डर",
+        inventoryHealth: "इन्वेंटरी स्वास्थ्य",
+        fulfillmentRate: "पूर्ति दर",
+        atRiskSuppliers: "जोखिम में आपूर्तिकर्ता",
+        riskScore: "सप्लाई चेन जोखिम स्कोर",
+        recoveryTime: "अनुमानित बहाली समय",
+        logisticsCost: "कुल रसद लागत",
+        runAiAnalysis: "एआई विश्लेषण चलाएं",
+        normal: "सामान्य",
+        warning: "चेतावनी",
+        critical: "गंभीर",
+        supplierStatus: "आपूर्तिकर्ता स्थिति",
+        shipmentTracking: "शिपमेंट ट्रैकिंग",
+        warehouseStatus: "गोदाम स्थिति",
+        inventoryLevels: "इन्वेंटरी स्तर",
+        productionStatus: "उत्पादन स्थिति",
+        logisticsStatus: "रसद स्थिति",
+        supplyShortagePredicted: "आपूर्ति की कमी का अनुमान",
+        demandForecast: "मांग पूर्वानुमान",
+        inventoryForecast: "इन्वेंटरी पूर्वानुमान",
+        supplyForecast: "आपूर्ति पूर्वानुमान",
+        demandVsSupplyTitle: "मांग बनाम आपूर्ति रुझान विश्लेषण",
+        demandLine: "मांग (इकाइयां)",
+        supplyLine: "आपूर्ति (इकाइयां)",
+        recommendedSupplier: "अनुशंसित आपूर्तिकर्ता",
+        estimatedCostImpact: "अनुमानित लागत प्रभाव",
+        confidenceLevel: "विश्वास स्तर",
+        logisticsStrategy: "रसद रणनीति",
+        inventoryPlan: "इन्वेंटरी पुनर्वितरण योजना",
+        productionPlan: "उत्पादन पुनर्निर्धारण योजना",
+        liveUpdatesActive: "लाइव टेलीमेट्री सक्रिय",
+        switchTheme: "थीम बदलें"
+    },
+    ta: {
+        appName: "பிரபந்தனா AI",
+        tagline: "AI-இயங்கும் விநியோகச் சங்கிலி மீள்தன்மை & உலகளாவிய செயல்பாடுகள் கட்டளை மையம்",
+        navDashboard: "டாஷ்போர்டு",
+        navTracking: "நிகழ்நேர கண்காணிப்பு",
+        navAgents: "மல்டி-ஏஜென்ட் AI",
+        navSimulator: "இடையூறு சிமுலேட்டர்",
+        navRecommendations: "AI பரிந்துரைகள்",
+        navAnalytics: "தேவை vs வழங்கல்",
+        totalSuppliers: "மொத்த சப்ளையர்கள்",
+        activeOrders: "செயலில் உள்ள ஆர்டர்கள்",
+        inventoryHealth: "சரக்கு இருப்பு நலம்",
+        fulfillmentRate: "நிறைவேற்றல் விகிதம்",
+        atRiskSuppliers: "ஆபத்தில் உள்ள சப்ளையர்கள்",
+        riskScore: "விநியோகச் சங்கிலி இடர் மதிப்பெண்",
+        recoveryTime: "மீட்பு நேர மதிப்பீடு",
+        logisticsCost: "மொத்த தளவாட செலவு",
+        runAiAnalysis: "AI பகுப்பாய்வை இயக்கு",
+        normal: "இயல்பானது",
+        warning: "எச்சரிக்கை",
+        critical: "முக்கியமானது",
+        supplierStatus: "சப்ளையர் நிலை",
+        shipmentTracking: "ஏற்றுமதி கண்காணிப்பு",
+        warehouseStatus: "கிடங்கு நிலை",
+        inventoryLevels: "சரக்கு நிலைகள்",
+        productionStatus: "உற்பத்தி நிலை",
+        logisticsStatus: "தளவாட நிலை",
+        supplyShortagePredicted: "விநியோக பற்றாக்குறை கணிக்கப்பட்டுள்ளது",
+        demandForecast: "தேவை முன்னறிவிப்பு",
+        inventoryForecast: "சரக்கு முன்னறிவிப்பு",
+        supplyForecast: "வழங்கல் முன்னறிவிப்பு",
+        demandVsSupplyTitle: "தேவை vs வழங்கல் போக்கு பகுப்பாய்வு",
+        demandLine: "தேவை (அலகுகள்)",
+        supplyLine: "வழங்கல் (அலகுகள்)",
+        recommendedSupplier: "பரிந்துரைக்கப்பட்ட சப்ளையர்",
+        estimatedCostImpact: "மதிப்பிடப்பட்ட செலவு தாக்கம்",
+        confidenceLevel: "நம்பகத்தன்மை நிலை",
+        logisticsStrategy: "தளவாட உத்தி",
+        inventoryPlan: "சரக்கு மறுபங்கீட்டு திட்டம்",
+        productionPlan: "உற்பத்தி மறுதிட்டமிடல் திட்டம்",
+        liveUpdatesActive: "நேரலை கண்காணிப்பு செயலில் உள்ளது",
+        switchTheme: "தீம் மாற்று"
+    },
+    kn: {
+        appName: "ಪ್ರಬಂಧನಾ AI",
+        tagline: "AI-ಚಾಲಿತ ಪೂರೈಕೆ ಸರಪಳಿ ಸ್ಥಿತಿಸ್ಥಾಪಕತ್ವ & ಜಾಗತಿಕ ಕಾರ್ಯಾಚರಣೆಗಳ ಕಮಾಂಡ್ ಸೆಂಟರ್",
+        navDashboard: "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್",
+        navTracking: "ನೈಜ-ಸಮಯದ ಟ್ರ್ಯಾಕಿಂಗ್",
+        navAgents: "ಮಲ್ಟಿ-ಏಜೆಂಟ್ AI",
+        navSimulator: "ಅಡ್ಡಿ ಸಿಮ್ಯುಲೇಟರ್",
+        navRecommendations: "AI ಶಿಫಾರಸುಗಳು",
+        navAnalytics: "ಬೇಡಿಕೆ vs ಪೂರೈಕೆ",
+        totalSuppliers: "ಒಟ್ಟು ಪೂರೈಕೆದಾರರು",
+        activeOrders: "ಸಕ್ರಿಯ ಆದೇಶಗಳು",
+        inventoryHealth: "ದಾಸ್ತಾನು ಆರೋಗ್ಯ",
+        fulfillmentRate: "ಪೂರೈಕೆ ದರ",
+        atRiskSuppliers: "ಅಪಾಯದಲ್ಲಿರುವ ಪೂರೈಕೆದಾರರು",
+        riskScore: "ಪೂರೈಕೆ ಸರಪಳಿ ಅಪಾಯದ ಅಂಕ",
+        recoveryTime: "ಚೇತರಿಕೆಯ ಸಮಯ ಅಂದಾಜು",
+        logisticsCost: "ಒಟ್ಟು ಲಾಜಿಸ್ಟಿಕ್ಸ್ ವೆಚ್ಚ",
+        runAiAnalysis: "AI ವಿಶ್ಲೇಷಣೆ ರನ್ ಮಾಡಿ",
+        normal: "ಸಾಮಾನ್ಯ",
+        warning: "ಎಚ್ಚರಿಕೆ",
+        critical: "ನಿರ್ಣಾಯಕ",
+        supplierStatus: "ಪೂರೈಕೆದಾರರ ಸ್ಥಿತಿ",
+        shipmentTracking: "ರವಾನೆ ಟ್ರ್ಯಾಕಿಂಗ್",
+        warehouseStatus: "ಗೋದಾಮಿನ ಸ್ಥಿತಿ",
+        inventoryLevels: "ದಾಸ್ತಾನು ಮಟ್ಟಗಳು",
+        productionStatus: "ಉತ್ಪಾದನಾ ಸ್ಥಿತಿ",
+        logisticsStatus: "ಲಾಜಿಸ್ಟಿಕ್ಸ್ ಸ್ಥಿತಿ",
+        supplyShortagePredicted: "ಪೂರೈಕೆ ಕೊರತೆ ಊಹಿಸಲಾಗಿದೆ",
+        demandForecast: "ಬೇಡಿಕೆ ಮುನ್ಸೂಚನೆ",
+        inventoryForecast: "ದಾಸ್ತಾನು ಮುನ್ಸೂಚನೆ",
+        supplyForecast: "ಪೂರೈಕೆ ಮುನ್ಸೂಚನೆ",
+        demandVsSupplyTitle: "ಬೇಡಿಕೆ vs ಪೂರೈಕೆ ಪ್ರವೃತ್ತಿ ವಿಶ್ಲೇಷಣೆ",
+        demandLine: "ಬೇಡಿಕೆ (ಘಟಕಗಳು)",
+        supplyLine: "ಪೂರೈಕೆ (ಘಟಕಗಳು)",
+        recommendedSupplier: "ಶಿಫಾರಸು ಮಾಡಿದ ಪೂರೈಕೆದಾರ",
+        estimatedCostImpact: "ಅಂದಾಜು ವೆಚ್ಚದ ಪ್ರಭಾವ",
+        confidenceLevel: "ವಿಶ್ವಾಸಾರ್ಹತೆ ಮಟ್ಟ",
+        logisticsStrategy: "ಲಾಜಿಸ್ಟಿಕ್ಸ್ ತಂತ್ರ",
+        inventoryPlan: "ದಾಸ್ತಾನು ಮರುಹಂಚಿಕೆ ಯೋಜನೆ",
+        productionPlan: "ಉತ್ಪಾದನೆ ಮರುಹೊಂದಿಸುವ ಯೋಜನೆ",
+        liveUpdatesActive: "ಲೈವ್ ಟೆಲಿಮೆಟ್ರಿ ಸಕ್ರಿಯವಾಗಿದೆ",
+        switchTheme: "ಥೀಮ್ ಬದಲಾಯಿಸಿ"
+    },
+    ml: {
+        appName: "പ്രബന്ധന AI",
+        tagline: "AI അധിഷ്ഠിത സപ്ലൈ ചെയിൻ റെസിലിയൻസ് & ഗ്ലോബൽ ഓപ്പറേഷൻസ് കമാൻഡ് സെന്റർ",
+        navDashboard: "ഡാഷ്‌ബോർഡ്",
+        navTracking: "തത്സമയ ട്രാക്കിംഗ്",
+        navAgents: "മൾട്ടി-ഏജന്റ് AI",
+        navSimulator: "തടസ്സ സിമുലേറ്റർ",
+        navRecommendations: "AI ശുപാർശകൾ",
+        navAnalytics: "ഡിമാൻഡ് vs സപ്ലൈ",
+        totalSuppliers: "മൊത്തം വിതരണക്കാർ",
+        activeOrders: "സജീവ ഓർഡറുകൾ",
+        inventoryHealth: "ഇൻവെന്ററി ആരോഗ്യം",
+        fulfillmentRate: "പൂർത്തീകരണ നിരക്ക്",
+        atRiskSuppliers: "അപകടസാധ്യതയുള്ള വിതരണക്കാർ",
+        riskScore: "സപ്ലൈ ചെയിൻ റിസ്ക് സ്കോർ",
+        recoveryTime: "വീണ്ടെടുക്കൽ സമയ കണക്കാക്കൽ",
+        logisticsCost: "മൊത്തം ലോജിസ്റ്റിക്സ് ചിലവ്",
+        runAiAnalysis: "AI വിശകലനം ആരംഭിക്കുക",
+        normal: "സാധാരണ",
+        warning: "മുന്നറിയിപ്പ്",
+        critical: "നിർണായകം",
+        supplierStatus: "വിതരണക്കാരന്റെ അവസ്ഥ",
+        shipmentTracking: "ഷിപ്പ്മെന്റ് ട്രാക്കിംഗ്",
+        warehouseStatus: "വെയർഹൗസ് അവസ്ഥ",
+        inventoryLevels: "ഇൻവെന്ററി ലെവലുകൾ",
+        productionStatus: "ഉൽപ്പാദന അവസ്ഥ",
+        logisticsStatus: "ലോജിസ്റ്റിക്സ് അവസ്ഥ",
+        supplyShortagePredicted: "വിതരണ കുറവ് പ്രവചിക്കപ്പെടുന്നു",
+        demandForecast: "ഡിമാൻഡ് പ്രവചനം",
+        inventoryForecast: "ഇൻവെന്ററി പ്രവചനം",
+        supplyForecast: "സപ്ലൈ പ്രവചനം",
+        demandVsSupplyTitle: "ഡിമാൻഡ് vs സപ്ലൈ ട്രെൻഡ് അനാലിസിസ്",
+        demandLine: "ഡിമാൻഡ് (യൂണിറ്റുകൾ)",
+        supplyLine: "സപ്ലൈ (യൂണിറ്റുകൾ)",
+        recommendedSupplier: "ശുപാർശ ചെയ്ത വിതരണക്കാരൻ",
+        estimatedCostImpact: "കണക്കാക്കിയ ചിലവ് ആഘാതം",
+        confidenceLevel: "വിശ്വാസ്യത ലെവൽ",
+        logisticsStrategy: "ലോജിസ്റ്റിക്സ് തന്ത്രം",
+        inventoryPlan: "ഇൻവെന്ററി പുനർവിതരണ പദ്ധതി",
+        productionPlan: "ഉൽപ്പാദന പുനഃക്രമീകരണ പദ്ധതി",
+        liveUpdatesActive: "തത്സമയ ടെലിമെട്രി സജീവമാണ്",
+        switchTheme: "തീം മാറ്റുക"
+    },
+    mr: {
+        appName: "प्रबंधना AI",
+        tagline: "AI-सक्षम पुरवठा साखळी लवचिकता आणि जागतिक ऑपरेशन्स कमांड सेंटर",
+        navDashboard: "डॅशबोर्ड",
+        navTracking: "रिअल-टाइम ट्रॅकिंग",
+        navAgents: "मल्टी-एजंट AI",
+        navSimulator: "व्यत्यय सिम्युलेटर",
+        navRecommendations: "AI शिफारसी",
+        navAnalytics: "मागणी वि पुरवठा",
+        totalSuppliers: "एकूण पुरवठादार",
+        activeOrders: "सक्रिय ऑर्डर्स",
+        inventoryHealth: "इन्व्हेंटरी आरोग्य",
+        fulfillmentRate: "पूर्तता दर",
+        atRiskSuppliers: "धोक्यात असलेले पुरवठादार",
+        riskScore: "पुरवठा साखळी जोखीम स्कोअर",
+        recoveryTime: "अंदाजे पुनर्प्राप्ती वेळ",
+        logisticsCost: "एकूण लॉजिस्टिक्स खर्च",
+        runAiAnalysis: "AI विश्लेषण चालवा",
+        normal: "सामान्य",
+        warning: "चेतावणी",
+        critical: "गंभीर",
+        supplierStatus: "पुरवठादार स्थिती",
+        shipmentTracking: "शिपमेंट ट्रॅकिंग",
+        warehouseStatus: "वेअरहाऊस स्थिती",
+        inventoryLevels: "इन्व्हेंटरी पातळी",
+        productionStatus: "उत्पादन स्थिती",
+        logisticsStatus: "लॉजिस्टिक्स स्थिती",
+        supplyShortagePredicted: "पुरवठा तुटवड्याचा अंदाज",
+        demandForecast: "मागणी अंदाज",
+        inventoryForecast: "इन्व्हेंटरी अंदाज",
+        supplyForecast: "पुरवठा अंदाज",
+        demandVsSupplyTitle: "मागणी वि पुरवठा कल विश्लेषण",
+        demandLine: "मागणी (युनिट्स)",
+        supplyLine: "पुरवठा (युनिट्स)",
+        recommendedSupplier: "शिफारस केलेला पुरवठादार",
+        estimatedCostImpact: "अंदाजे खर्च प्रभाव",
+        confidenceLevel: "विश्वास पातळी",
+        logisticsStrategy: "लॉजिस्टिक्स धोरण",
+        inventoryPlan: "इन्व्हेंटरी पुनर्वितरण योजना",
+        productionPlan: "उत्पादन पुनर्निर्धारण योजना",
+        liveUpdatesActive: "लाइव्ह टेलिमेट्री सक्रिय",
+        switchTheme: "थीम बदला"
+    },
+    bn: {
+        appName: "প্রবন্ধনা AI",
+        tagline: "AI-চালিত সরবরাহ চেইন স্থিতিস্থাপকতা এবং গ্লোবাল অপারেশন কমান্ড সেন্টার",
+        navDashboard: "ড্যাশবোর্ড",
+        navTracking: "রিয়েল-টাইম ট্র্যাকিং",
+        navAgents: "মাল্টি-এজেন্ট AI",
+        navSimulator: "বিঘ্ন সিমুলেটর",
+        navRecommendations: "AI সুপারিশ",
+        navAnalytics: "চাহিদা বনাম সরবরাহ",
+        totalSuppliers: "মোট সরবরাহকারী",
+        activeOrders: "সক্রিয় অর্ডার",
+        inventoryHealth: "ইনভেন্টরি স্বাস্থ্য",
+        fulfillmentRate: "পূরণ হার",
+        atRiskSuppliers: "ঝুঁকিপূর্ণ সরবরাহকারী",
+        riskScore: "সাপ্লাই চেইন ঝুঁকি স্কোর",
+        recoveryTime: "পুনরুদ্ধারের সময় অনুমান",
+        logisticsCost: "মোট লজিস্টিক খরচ",
+        runAiAnalysis: "AI বিশ্লেষণ চালান",
+        normal: "স্বাভাবিক",
+        warning: "সতর্কতা",
+        critical: "গুরুতর",
+        supplierStatus: "সরবরাহকারী স্ট্যাটাস",
+        shipmentTracking: "শিপমেন্ট ট্র্যাকিং",
+        warehouseStatus: "গুদাম স্ট্যাটাস",
+        inventoryLevels: "ইনভেন্টরি লেভেল",
+        productionStatus: "উৎপাদন স্ট্যাটাস",
+        logisticsStatus: "লজিস্টিক স্ট্যাটাস",
+        supplyShortagePredicted: "সরবরাহ ঘাটতির পূর্বাভাস",
+        demandForecast: "চাহিদা পূর্বাভাস",
+        inventoryForecast: "ইনভেন্টরি পূর্বাভাস",
+        supplyForecast: "সরবরাহ পূর্বাভাস",
+        demandVsSupplyTitle: "চাহিদা বনাম সরবরাহ প্রবণতা বিশ্লেষণ",
+        demandLine: "চাহিদা (ইউনিট)",
+        supplyLine: "সরবরাহ (ইউনিট)",
+        recommendedSupplier: "সুপারিশকৃত সরবরাহকারী",
+        estimatedCostImpact: "আনুমানিক ব্যয় প্রভাব",
+        confidenceLevel: "আত্মবিশ্বাসের মাত্রা",
+        logisticsStrategy: "লজিস্টিক কৌশল",
+        inventoryPlan: "ইনভেন্টরি পুনর্বণ্টন পরিকল্পনা",
+        productionPlan: "উৎপাদন পুনর্নির্ধারণ পরিকল্পনা",
+        liveUpdatesActive: "লাইভ টেলিমেট্রি সক্রিয়",
+        switchTheme: "থিম পরিবর্তন"
+    },
+    gu: {
+        appName: "પ્રબંધના AI",
+        tagline: "AI-સંચાલિત સપ્લાય ચેઇન સ્થિતિસ્થાપકતા અને ગ્લોબલ ઓપરેશન્સ કમાન્ડ સેન્ટર",
+        navDashboard: "ડેશબોર્ડ",
+        navTracking: "રિયલ-ટાઇમ ટ્રેકિંગ",
+        navAgents: "મલ્ટી-એજન્ટ AI",
+        navSimulator: "વિક્ષેપ સિમ્યુલેટર",
+        navRecommendations: "AI ભલામણો",
+        navAnalytics: "માંગ વિ પુરવઠો",
+        totalSuppliers: "કુલ સપ્લાયર્સ",
+        activeOrders: "સક્રિય ઓર્ડર",
+        inventoryHealth: "ઇન્વેન્ટરી આરોગ્ય",
+        fulfillmentRate: "પૂર્ણતા દર",
+        atRiskSuppliers: "જોખમમાં રહેલા સપ્લાયર્સ",
+        riskScore: "સપ્લાય ચેઇન જોખમ સ્કોર",
+        recoveryTime: "અંદાજિત પુનઃપ્રાપ્તિ સમય",
+        logisticsCost: "કુલ લોજિસ્ટિક્સ ખર્ચ",
+        runAiAnalysis: "AI વિશ્લેષણ ચલાવો",
+        normal: "સામાન્ય",
+        warning: "ચેતવણી",
+        critical: "ગંભીર",
+        supplierStatus: "સપ્લાયર સ્થિતિ",
+        shipmentTracking: "શિપમેન્ટ ટ્રેકિંગ",
+        warehouseStatus: "વેરહાઉસ સ્થિતિ",
+        inventoryLevels: "ઇન્વેન્ટરી સ્તરો",
+        productionStatus: "ઉત્પાદન સ્થિતિ",
+        logisticsStatus: "લોજિસ્ટિક્સ સ્થિતિ",
+        supplyShortagePredicted: "પુરવઠાની અછતની આગાહી",
+        demandForecast: "માંગ આગાહી",
+        inventoryForecast: "ઇન્વેન્ટરી આગાહી",
+        supplyForecast: "પુરવઠા આગાહી",
+        demandVsSupplyTitle: "માંગ વિ પુરવઠા પ્રવાહ વિશ્લેષણ",
+        demandLine: "માંગ (એકમો)",
+        supplyLine: "પુરવઠો (એકમો)",
+        recommendedSupplier: "ભલામણ કરેલ સપ્લાયર",
+        estimatedCostImpact: "અંદાજિત ખર્ચ અસર",
+        confidenceLevel: "વિશ્વાસ સ્તર",
+        logisticsStrategy: "લોજિસ્ટિક્સ વ્યૂહરચના",
+        inventoryPlan: "ઇન્વેન્ટરી પુનઃવિતરણ યોજના",
+        productionPlan: "ઉત્પાદન પુનઃનિર્ધારણ યોજના",
+        liveUpdatesActive: "લાઇવ ટેલિમેટ્રી સક્રિય",
+        switchTheme: "થીમ બદલો"
+    },
+    pa: {
+        appName: "ਪ੍ਰਬੰਧਨਾ AI",
+        tagline: "AI-ਅਧਾਰਤ ਸਪਲਾਈ ਚੇਨ ਲਚਕੀਲਾਪਣ ਅਤੇ ਗਲੋਬਲ ਓਪਰੇਸ਼ਨ ਕਮਾਂਡ ਸੈਂਟਰ",
+        navDashboard: "ਡੈਸ਼ਬੋਰਡ",
+        navTracking: "ਰੀਅਲ-ਟਾਈਮ ਟਰੈਕਿੰਗ",
+        navAgents: "ਮਲਟੀ-ਏਜੰਟ AI",
+        navSimulator: "ਰੁਕਾਵਟ ਸਿਮੂਲੇਟਰ",
+        navRecommendations: "AI ਸਿਫ਼ਾਰਸ਼ਾਂ",
+        navAnalytics: "ਮੰਗ ਬਨਾਮ ਸਪਲਾਈ",
+        totalSuppliers: "ਕੁੱਲ ਸਪਲਾਇਰ",
+        activeOrders: "ਸਰਗਰਮ ਆਰਡਰ",
+        inventoryHealth: "ਇਨਵੈਂਟਰੀ ਸਿਹਤ",
+        fulfillmentRate: "ਪੂਰਤੀ ਦਰ",
+        atRiskSuppliers: "ਖ਼ਤਰੇ ਵਿੱਚ ਸਪਲਾਇਰ",
+        riskScore: "ਸਪਲਾਈ ਚੇਨ ਜੋਖਮ ਸਕੋਰ",
+        recoveryTime: "ਅਨੁਮਾਨਿਤ ਰਿਕਵਰੀ ਸਮਾਂ",
+        logisticsCost: "ਕੁੱਲ ਲੌਜਿਸਟਿਕਸ ਲਾਗਤ",
+        runAiAnalysis: "AI ਵਿਸ਼ਲੇਸ਼ਣ ਚਲਾਓ",
+        normal: "ਆਮ",
+        warning: "ਚੇਤਾਵਨੀ",
+        critical: "ਗੰਭੀਰ",
+        supplierStatus: "ਸਪਲਾਇਰ ਸਥਿਤੀ",
+        shipmentTracking: "ਸ਼ਿਪਮੈਂਟ ਟਰੈਕਿੰਗ",
+        warehouseStatus: "ਵੇਅਰਹਾਊਸ ਸਥਿਤੀ",
+        inventoryLevels: "ਇਨਵੈਂਟਰੀ ਪੱਧਰ",
+        productionStatus: "ਉਤਪਾਦਨ ਸਥਿਤੀ",
+        logisticsStatus: "ਲੌਜਿਸਟਿਕਸ ਸਥਿਤੀ",
+        supplyShortagePredicted: "ਸਪਲਾਈ ਦੀ ਘਾਟ ਦੀ ਭਵਿੱਖਬਾਣੀ",
+        demandForecast: "ਮੰਗ ਪੂਰਵ-ਅਨੁਮਾਨ",
+        inventoryForecast: "ਇਨਵੈਂਟਰੀ ਪੂਰਵ-ਅਨੁਮਾਨ",
+        supplyForecast: "ਸਪਲਾਈ ਪੂਰਵ-ਅਨੁਮਾਨ",
+        demandVsSupplyTitle: "ਮੰਗ ਬਨਾਮ ਸਪਲਾਈ ਰੁਝਾਨ ਵਿਸ਼ਲੇਸ਼ਣ",
+        demandLine: "ਮੰਗ (ਇਕਾਈਆਂ)",
+        supplyLine: "ਸਪਲਾਈ (ਇਕਾਈਆਂ)",
+        recommendedSupplier: "ਸਿਫ਼ਾਰਸ਼ ਕੀਤਾ ਸਪਲਾਇਰ",
+        estimatedCostImpact: "ਅਨੁਮਾਨਿਤ ਲਾਗਤ ਪ੍ਰਭਾਵ",
+        confidenceLevel: "ਭਰੋਸਾ ਪੱਧਰ",
+        logisticsStrategy: "ਲੌਜਿਸਟਿਕਸ ਰਣਨੀਤੀ",
+        inventoryPlan: "ਇਨਵੈਂਟਰੀ ਪੁਨਰ-ਵੰਡ ਯੋਜਨਾ",
+        productionPlan: "ਉਤਪਾਦਨ ਪੁਨਰ-ਨਿਰਧਾਰਨ ਯੋਜਨਾ",
+        liveUpdatesActive: "ਲਾਈਵ ਟੈਲੀਮੈਟਰੀ ਸਰਗਰਮ ਹੈ",
+        switchTheme: "ਥੀਮ ਬਦਲੋ"
+    },
+    es: {
+        appName: "Prabandhana AI",
+        tagline: "Centro de Comando de Operaciones Globales y Resiliencia de la Cadena de Suministro con IA",
+        navDashboard: "Panel de Control",
+        navTracking: "Seguimiento en Tiempo Real",
+        navAgents: "IA Multiagente",
+        navSimulator: "Simulador de Disrupciones",
+        navRecommendations: "Recomendaciones IA",
+        navAnalytics: "Demanda vs Suministro",
+        totalSuppliers: "Proveedores Totales",
+        activeOrders: "Pedidos Activos",
+        inventoryHealth: "Salud del Inventario",
+        fulfillmentRate: "Tasa de Cumplimiento",
+        atRiskSuppliers: "Proveedores en Riesgo",
+        riskScore: "Puntaje de Riesgo",
+        recoveryTime: "Tiempo Estimado de Recuperación",
+        logisticsCost: "Costo Total de Logística",
+        runAiAnalysis: "Ejecutar Análisis IA",
+        normal: "Normal",
+        warning: "Advertencia",
+        critical: "Crítico",
+        supplierStatus: "Estado del Proveedor",
+        shipmentTracking: "Rastreo de Envíos",
+        warehouseStatus: "Estado del Almacén",
+        inventoryLevels: "Niveles de Inventario",
+        productionStatus: "Estado de Producción",
+        logisticsStatus: "Estado de Logística",
+        supplyShortagePredicted: "Escasez de Suministro Pronosticada",
+        demandForecast: "Pronóstico de Demanda",
+        inventoryForecast: "Pronóstico de Inventario",
+        supplyForecast: "Pronóstico de Suministro",
+        demandVsSupplyTitle: "Análisis de Tendencia: Demanda vs Suministro",
+        demandLine: "Demanda (Unidades)",
+        supplyLine: "Suministro (Unidades)",
+        recommendedSupplier: "Proveedor Recomendado",
+        estimatedCostImpact: "Impacto de Costo Estimado",
+        confidenceLevel: "Nivel de Confianza",
+        logisticsStrategy: "Estrategia Logística",
+        inventoryPlan: "Plan de Reasignación de Inventario",
+        productionPlan: "Plan de Reprogramación de Producción",
+        liveUpdatesActive: "Telemetría en Vivo Activa",
+        switchTheme: "Cambiar Tema"
+    },
+    fr: {
+        appName: "Prabandhana AI",
+        tagline: "Centre de Commandement des Opérations Globales et Résilience de la Chaîne Logistique par IA",
+        navDashboard: "Tableau de Bord",
+        navTracking: "Suivi en Temps Réel",
+        navAgents: "IA Multi-Agents",
+        navSimulator: "Simulateur de Perturbations",
+        navRecommendations: "Recommandations IA",
+        navAnalytics: "Demande vs Offre",
+        totalSuppliers: "Fournisseurs Totaux",
+        activeOrders: "Commandes Actives",
+        inventoryHealth: "Santé des Stocks",
+        fulfillmentRate: "Taux d'Exécution",
+        atRiskSuppliers: "Fournisseurs à Risque",
+        riskScore: "Score de Risque Global",
+        recoveryTime: "Temps de Récupération Estimé",
+        logisticsCost: "Coût Logistique Total",
+        runAiAnalysis: "Lancer l'Analyse IA",
+        normal: "Normal",
+        warning: "Avertissement",
+        critical: "Critique",
+        supplierStatus: "Statut Fournisseur",
+        shipmentTracking: "Suivi des Expéditions",
+        warehouseStatus: "Statut des Entrepôts",
+        inventoryLevels: "Niveaux de Stock",
+        productionStatus: "Statut de Production",
+        logisticsStatus: "Statut Logistique",
+        supplyShortagePredicted: "Pénurie d'Approvisionnement Prévue",
+        demandForecast: "Prévision de la Demande",
+        inventoryForecast: "Prévision des Stocks",
+        supplyForecast: "Prévision de l'Offre",
+        demandVsSupplyTitle: "Analyse des Tendances : Demande vs Offre",
+        demandLine: "Demande (Unités)",
+        supplyLine: "Offre (Unités)",
+        recommendedSupplier: "Fournisseur Recommandé",
+        estimatedCostImpact: "Impact Financier Estimé",
+        confidenceLevel: "Niveau de Confiance",
+        logisticsStrategy: "Stratégie Logistique",
+        inventoryPlan: "Plan de Réallocation des Stocks",
+        productionPlan: "Plan de Replanification de Production",
+        liveUpdatesActive: "Télémétrie en Direct Active",
+        switchTheme: "Changer de Thème"
+    },
+    de: {
+        appName: "Prabandhana AI",
+        tagline: "KI-gesteuertes Kontrollzentrum für Lieferketten-Resilienz & Globale Operationen",
+        navDashboard: "Dashboard",
+        navTracking: "Echtzeit-Verfolgung",
+        navAgents: "Multi-Agenten-KI",
+        navSimulator: "Störungssimulator",
+        navRecommendations: "KI-Empfehlungen",
+        navAnalytics: "Bedarf vs. Angebot",
+        totalSuppliers: "Lieferanten Gesamt",
+        activeOrders: "Aktive Bestellungen",
+        inventoryHealth: "Bestandsgesundheit",
+        fulfillmentRate: "Erfüllungsrate",
+        atRiskSuppliers: "Gefährdete Lieferanten",
+        riskScore: "Lieferketten-Risikoscore",
+        recoveryTime: "Geschätzte Erholungszeit",
+        logisticsCost: "Gesamte Logistikkosten",
+        runAiAnalysis: "KI-Analyse Ausführen",
+        normal: "Normal",
+        warning: "Warnung",
+        critical: "Kritisch",
+        supplierStatus: "Lieferantenstatus",
+        shipmentTracking: "Sendungsverfolgung",
+        warehouseStatus: "Lagerstatus",
+        inventoryLevels: "Bestandsniveaus",
+        productionStatus: "Produktionsstatus",
+        logisticsStatus: "Logistikstatus",
+        supplyShortagePredicted: "Lieferengpass Vorhergesagt",
+        demandForecast: "Bedarfsprognose",
+        inventoryForecast: "Bestandsprognose",
+        supplyForecast: "Angebotsprognose",
+        demandVsSupplyTitle: "Trendanalyse: Bedarf vs. Angebot",
+        demandLine: "Bedarf (Einheiten)",
+        supplyLine: "Angebot (Einheiten)",
+        recommendedSupplier: "Empfohlener Lieferant",
+        estimatedCostImpact: "Geschätzte Kostenauswirkung",
+        confidenceLevel: "Konfidenzniveau",
+        logisticsStrategy: "Logistikstrategie",
+        inventoryPlan: "Bestandsumverteilungsplan",
+        productionPlan: "Produktionsneuplanungsplan",
+        liveUpdatesActive: "Live-Telemetrie Aktiv",
+        switchTheme: "Design Umschalten"
+    },
+    zh: {
+        appName: "Prabandhana AI",
+        tagline: "AI驱动的供应链韧性与全球运营指挥中心",
+        navDashboard: "仪表板",
+        navTracking: "实时追踪",
+        navAgents: "多智能体AI系统",
+        navSimulator: "中断模拟中心",
+        navRecommendations: "AI决策建议",
+        navAnalytics: "需求与供应分析",
+        totalSuppliers: "供应商总数",
+        activeOrders: "活跃订单",
+        inventoryHealth: "库存健康度",
+        fulfillmentRate: "履约率",
+        atRiskSuppliers: "高风险供应商",
+        riskScore: "供应链风险评分",
+        recoveryTime: "预计恢复时间",
+        logisticsCost: "总物流成本",
+        runAiAnalysis: "运行AI智能分析",
+        normal: "正常",
+        warning: "预警",
+        critical: "紧急",
+        supplierStatus: "供应商状态",
+        shipmentTracking: "货物在途追踪",
+        warehouseStatus: "仓库运行状态",
+        inventoryLevels: "当前库存水平",
+        productionStatus: "产线生产状态",
+        logisticsStatus: "物流调度状态",
+        supplyShortagePredicted: "预测供应短缺",
+        demandForecast: "需求预测",
+        inventoryForecast: "库存预测",
+        supplyForecast: "供应预测",
+        demandVsSupplyTitle: "需求与供应趋势深度分析",
+        demandLine: "需求量 (单位)",
+        supplyLine: "供应量 (单位)",
+        recommendedSupplier: "推荐替代供应商",
+        estimatedCostImpact: "预估成本影响",
+        confidenceLevel: "AI置信度",
+        logisticsStrategy: "优选物流策略",
+        inventoryPlan: "库存重新调配方案",
+        productionPlan: "生产排程调整方案",
+        liveUpdatesActive: "实时遥测活跃中",
+        switchTheme: "切换主题"
+    },
+    ja: {
+        appName: "Prabandhana AI",
+        tagline: "AI駆動型サプライチェーン・レジリエンス＆グローバル運用司令センター",
+        navDashboard: "ダッシュボード",
+        navTracking: "リアルタイム追跡",
+        navAgents: "マルチエージェントAI",
+        navSimulator: "供給途絶シミュレーター",
+        navRecommendations: "AI推奨戦略",
+        navAnalytics: "需要と供給の分析",
+        totalSuppliers: "総サプライヤー数",
+        activeOrders: "進行中注文数",
+        inventoryHealth: "在庫健全性スコア",
+        fulfillmentRate: "注文履行率",
+        atRiskSuppliers: "高リスクサプライヤー",
+        riskScore: "サプライチェーンリスク値",
+        recoveryTime: "推定復旧時間",
+        logisticsCost: "総物流コスト",
+        runAiAnalysis: "AI解析を実行",
+        normal: "正常",
+        warning: "注意",
+        critical: "危機的",
+        supplierStatus: "サプライヤーステータス",
+        shipmentTracking: "輸送中貨物追跡",
+        warehouseStatus: "倉庫稼働状況",
+        inventoryLevels: "在庫レベル",
+        productionStatus: "生産ライン状況",
+        logisticsStatus: "物流ステータス",
+        supplyShortagePredicted: "供給不足の予測アラート",
+        demandForecast: "需要予測",
+        inventoryForecast: "在庫予測",
+        supplyForecast: "供給予測",
+        demandVsSupplyTitle: "需要と供給の推移分析",
+        demandLine: "需要量 (ユニット)",
+        supplyLine: "供給量 (ユニット)",
+        recommendedSupplier: "推奨代替サプライヤー",
+        estimatedCostImpact: "推定コスト影響",
+        confidenceLevel: "AI信頼度スコア",
+        logisticsStrategy: "推奨物流ルート戦略",
+        inventoryPlan: "在庫再配分計画",
+        productionPlan: "生産スケジュール再調整計画",
+        liveUpdatesActive: "リアルタイムテレメトリ稼働中",
+        switchTheme: "テーマ切替"
+    },
+    ar: {
+        appName: "براباندانا للذكاء الاصطناعي",
+        tagline: "مركز قيادة مرونة سلاسل الإمداد والعمليات العالمية المدعوم بالذكاء الاصطناعي",
+        navDashboard: "لوحة القيادة",
+        navTracking: "التتبع في الوقت الفعلي",
+        navAgents: "نظام الوكلاء المتعددين",
+        navSimulator: "محاكي الاضطرابات",
+        navRecommendations: "توصيات الذكاء الاصطناعي",
+        navAnalytics: "الطلب مقابل العرض",
+        totalSuppliers: "إجمالي الموردين",
+        activeOrders: "الطلبات النشطة",
+        inventoryHealth: "سلامة المخزون",
+        fulfillmentRate: "معدل الإنجاز",
+        atRiskSuppliers: "الموردون المعرضون للخطر",
+        riskScore: "مؤشر مخاطر سلسلة الإمداد",
+        recoveryTime: "الوقت المقدر للتعافي",
+        logisticsCost: "إجمالي تكاليف الخدمات اللوجستية",
+        runAiAnalysis: "تشغيل تحليل الذكاء الاصطناعي",
+        normal: "طبيعي",
+        warning: "تحذير",
+        critical: "حرج",
+        supplierStatus: "حالة المورد",
+        shipmentTracking: "تتبع الشحنات",
+        warehouseStatus: "حالة المستودعات",
+        inventoryLevels: "مستويات المخزون",
+        productionStatus: "حالة خطوط الإنتاج",
+        logisticsStatus: "حالة اللوجستيات",
+        supplyShortagePredicted: "توقع عجز في الإمدادات",
+        demandForecast: "توقعات الطلب",
+        inventoryForecast: "توقعات المخزون",
+        supplyForecast: "توقعات العرض",
+        demandVsSupplyTitle: "تحليل اتجاهات الطلب مقابل العرض",
+        demandLine: "الطلب (وحدات)",
+        supplyLine: "العرض (وحدات)",
+        recommendedSupplier: "المورد الموصى به",
+        estimatedCostImpact: "تأثير التكلفة المقدرة",
+        confidenceLevel: "مستوى الثقة",
+        logisticsStrategy: "الاستراتيجية اللوجستية",
+        inventoryPlan: "خطة إعادة تخصيص المخزون",
+        productionPlan: "خطة إعادة جدولة الإنتاج",
+        liveUpdatesActive: "القياس عن بُعد النشط",
+        switchTheme: "تبديل المظهر"
+    },
+    ru: {
+        appName: "Prabandhana AI",
+        tagline: "Командный центр устойчивости цепочек поставок и глобальных операций на базе ИИ",
+        navDashboard: "Панель управления",
+        navTracking: "Отслеживание в реальном времени",
+        navAgents: "Мультиагентный ИИ",
+        navSimulator: "Симулятор сбоев",
+        navRecommendations: "Рекомендации ИИ",
+        navAnalytics: "Спрос против предложения",
+        totalSuppliers: "Всего поставщиков",
+        activeOrders: "Активные заказы",
+        inventoryHealth: "Состояние запасов",
+        fulfillmentRate: "Коэффициент выполнения",
+        atRiskSuppliers: "Поставщики в зоне риска",
+        riskScore: "Оценка риска поставок",
+        recoveryTime: "Оценка времени восстановления",
+        logisticsCost: "Общая стоимость логистики",
+        runAiAnalysis: "Запустить анализ ИИ",
+        normal: "В норме",
+        warning: "Внимание",
+        critical: "Критично",
+        supplierStatus: "Статус поставщиков",
+        shipmentTracking: "Отслеживание грузов",
+        warehouseStatus: "Статус складов",
+        inventoryLevels: "Уровни запасов",
+        productionStatus: "Статус производства",
+        logisticsStatus: "Статус логистики",
+        supplyShortagePredicted: "Прогнозируется дефицит поставок",
+        demandForecast: "Прогноз спроса",
+        inventoryForecast: "Прогноз запасов",
+        supplyForecast: "Прогноз поставок",
+        demandVsSupplyTitle: "Анализ тренда: Спрос против предложения",
+        demandLine: "Спрос (единиц)",
+        supplyLine: "Поставки (единиц)",
+        recommendedSupplier: "Рекомендуемый поставщик",
+        estimatedCostImpact: "Оценка влияния на затраты",
+        confidenceLevel: "Уровень уверенности",
+        logisticsStrategy: "Логистическая стратегия",
+        inventoryPlan: "План перераспределения запасов",
+        productionPlan: "План переноса графиков производства",
+        liveUpdatesActive: "Телеметрия активна",
+        switchTheme: "Сменить тему"
+    },
+    pt: {
+        appName: "Prabandhana AI",
+        tagline: "Centro de Comando de Operações Globais e Resiliência da Cadeia de Suprimentos com IA",
+        navDashboard: "Painel Geral",
+        navTracking: "Rastreamento em Tempo Real",
+        navAgents: "IA Multiagente",
+        navSimulator: "Simulador de Rupturas",
+        navRecommendations: "Recomendações de IA",
+        navAnalytics: "Demanda vs Oferta",
+        totalSuppliers: "Fornecedores Totais",
+        activeOrders: "Pedidos Ativos",
+        inventoryHealth: "Saúde do Estoque",
+        fulfillmentRate: "Taxa de Atendimento",
+        atRiskSuppliers: "Fornecedores em Risco",
+        riskScore: "Pontuação de Risco da Cadeia",
+        recoveryTime: "Tempo Estimado de Recuperação",
+        logisticsCost: "Custo Logístico Total",
+        runAiAnalysis: "Executar Análise de IA",
+        normal: "Normal",
+        warning: "Aviso",
+        critical: "Crítico",
+        supplierStatus: "Status do Fornecedor",
+        shipmentTracking: "Rastreamento de Cargas",
+        warehouseStatus: "Status dos Armazéns",
+        inventoryLevels: "Níveis de Estoque",
+        productionStatus: "Status de Produção",
+        logisticsStatus: "Status Logístico",
+        supplyShortagePredicted: "Escassez de Oferta Prevista",
+        demandForecast: "Previsão de Demanda",
+        inventoryForecast: "Previsão de Estoque",
+        supplyForecast: "Previsão de Oferta",
+        demandVsSupplyTitle: "Análise de Tendência: Demanda vs Oferta",
+        demandLine: "Demanda (Unidades)",
+        supplyLine: "Oferta (Unidades)",
+        recommendedSupplier: "Fornecedor Recomendado",
+        estimatedCostImpact: "Impacto Estimado no Custo",
+        confidenceLevel: "Nível de Confiança",
+        logisticsStrategy: "Estratégia Logística",
+        inventoryPlan: "Plano de Realocação de Estoque",
+        productionPlan: "Plano de Reprogramação da Produção",
+        liveUpdatesActive: "Telemetria Ativa",
+        switchTheme: "Alternar Tema"
+    }
+};
+
+let currentLanguage = 'en';
+
+function setAppLanguage(langCode) {
+    if (SUPPORTED_LANGUAGES[langCode]) {
+        currentLanguage = langCode;
+        localStorage.setItem('prabandhana_lang', langCode);
+        
+        // Update document dir for RTL if Arabic
+        document.documentElement.setAttribute('dir', SUPPORTED_LANGUAGES[langCode].dir);
+        document.documentElement.setAttribute('lang', langCode);
+
+        // Update all elements with data-i18n attribute
+        document.querySelectorAll('[data-i18n]').forEach(el => {
+            const key = el.getAttribute('data-i18n');
+            const translation = t(key);
+            if (translation) {
+                if (el.tagName === 'INPUT' && el.getAttribute('placeholder')) {
+                    el.placeholder = translation;
+                } else {
+                    el.textContent = translation;
+                }
+            }
+        });
+
+        document.dispatchEvent(new CustomEvent('languageChanged', { detail: { language: langCode } }));
+    }
+}
+
+function t(key, fallback = null) {
+    const langDict = TRANSLATIONS[currentLanguage] || TRANSLATIONS.en;
+    if (langDict[key] !== undefined) {
+        return langDict[key];
+    }
+    if (TRANSLATIONS.en[key] !== undefined) {
+        return TRANSLATIONS.en[key];
+    }
+    return fallback || key;
+}
+
+function getAppLanguage() {
+    return currentLanguage;
+}
+
+// Initialize saved preference
+const savedLang = localStorage.getItem('prabandhana_lang');
+if (savedLang && SUPPORTED_LANGUAGES[savedLang]) {
+    currentLanguage = savedLang;
+}
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prabandhana AI — AI-Powered Supply Chain Resilience & Global Operations Command Center</title>
+    <meta name="description" content="Enterprise-grade multi-agent AI platform for resilient supply chain management in the manufacturing sector.">
+    <link rel="stylesheet" href="styles.css">
+    <!-- Chart.js for data visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-wrapper">
+        <!-- Top Navigation Bar -->
+        <header class="top-navbar" role="banner">
+            <div class="brand-section">
+                <div class="brand-logo-icon">⚡</div>
+                <div class="brand-title-wrap">
+                    <h1>
+                        <span data-i18n="appName">Prabandhana AI</span>
+                        <span>Enterprise AI</span>
+                    </h1>
+                    <p class="brand-subtitle" data-i18n="tagline">AI-Powered Supply Chain Resilience & Global Operations Command Center</p>
+                </div>
+            </div>
+
+            <!-- Main Navigation Tabs -->
+            <nav class="nav-tabs" role="navigation" aria-label="Main Navigation">
+                <button class="nav-tab-btn active" id="tab-dashboard" onclick="navigateToPage('dashboard')">
+                    <span>📊</span>
+                    <span data-i18n="navDashboard">Dashboard</span>
+                </button>
+                <button class="nav-tab-btn" id="tab-tracking" onclick="navigateToPage('tracking')">
+                    <span>📡</span>
+                    <span data-i18n="navTracking">Real-Time Tracking</span>
+                </button>
+                <button class="nav-tab-btn" id="tab-agents" onclick="navigateToPage('agents')">
+                    <span>🤖</span>
+                    <span data-i18n="navAgents">Multi-Agent AI</span>
+                </button>
+                <button class="nav-tab-btn" id="tab-simulator" onclick="navigateToPage('simulator')">
+                    <span>⚡</span>
+                    <span data-i18n="navSimulator">Disruption Simulator</span>
+                </button>
+                <button class="nav-tab-btn" id="tab-recommendations" onclick="navigateToPage('recommendations')">
+                    <span>🎯</span>
+                    <span data-i18n="navRecommendations">AI Recommendations</span>
+                </button>
+                <button class="nav-tab-btn" id="tab-analytics" onclick="navigateToPage('analytics')">
+                    <span>📈</span>
+                    <span data-i18n="navAnalytics">Demand vs Supply</span>
+                </button>
+            </nav>
+
+            <!-- Global Controls: 18 Languages, 10 Currencies, Theme Toggle, Live Status -->
+            <div class="top-bar-controls">
+                <!-- Multi-Language Selector (18 Languages) -->
+                <select class="ctrl-select" id="languageSelector" onchange="handleLanguageChange(this.value)" title="Select Language">
+                    <option value="en">🌐 English</option>
+                    <option value="te">🌐 తెలుగు (Telugu)</option>
+                    <option value="hi">🌐 हिन्दी (Hindi)</option>
+                    <option value="ta">🌐 தமிழ் (Tamil)</option>
+                    <option value="kn">🌐 ಕನ್ನಡ (Kannada)</option>
+                    <option value="ml">🌐 മലയാളം (Malayalam)</option>
+                    <option value="mr">🌐 मराठी (Marathi)</option>
+                    <option value="bn">🌐 বাংলা (Bengali)</option>
+                    <option value="gu">🌐 ગુજરાતી (Gujarati)</option>
+                    <option value="pa">🌐 ਪੰਜਾਬੀ (Punjabi)</option>
+                    <option value="es">🌐 Español (Spanish)</option>
+                    <option value="fr">🌐 Français (French)</option>
+                    <option value="de">🌐 Deutsch (German)</option>
+                    <option value="zh">🌐 中文 (Chinese)</option>
+                    <option value="ja">🌐 日本語 (Japanese)</option>
+                    <option value="ar">🌐 العربية (Arabic)</option>
+                    <option value="ru">🌐 Русский (Russian)</option>
+                    <option value="pt">🌐 Português (Portuguese)</option>
+                </select>
+
+                <!-- Multi-Currency Selector (10 Currencies) -->
+                <select class="ctrl-select" id="currencySelector" onchange="handleCurrencyChange(this.value)" title="Select Currency">
+                    <option value="USD">💵 USD ($)</option>
+                    <option value="INR">₹ INR (₹)</option>
+                    <option value="EUR">💶 EUR (€)</option>
+                    <option value="GBP">💷 GBP (£)</option>
+                    <option value="JPY">💴 JPY (¥)</option>
+                    <option value="CNY">元 CNY (¥)</option>
+                    <option value="AED">د.إ AED (AED)</option>
+                    <option value="CAD">C$ CAD (C$)</option>
+                    <option value="AUD">A$ AUD (A$)</option>
+                    <option value="SGD">S$ SGD (S$)</option>
+                </select>
+
+                <!-- Theme Toggle Button -->
+                <button class="btn-theme-toggle" id="themeToggleBtn" onclick="toggleAppTheme()" title="Toggle Dark/Light Theme">
+                    <span id="themeToggleIcon">☀️</span>
+                    <span id="themeToggleText">Light</span>
+                </button>
+
+                <!-- Live Status Indicator -->
+                <div class="live-pill" title="Autonomous Multi-Agent Telemetry Live">
+                    <span class="pulse-dot"></span>
+                    <span data-i18n="liveUpdatesActive">Live Telemetry Active</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Viewport -->
+        <main class="main-viewport" role="main">
+
+            <!-- ============================================================
+                 FEATURE 1: DASHBOARD
+                 ============================================================ -->
+            <section id="page-dashboard" class="page-view active">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>📊 <span data-i18n="navDashboard">Dashboard</span> & Executive Overview</h2>
+                        <p>Holistic health of global manufacturing supply chains, in-flight procurement, and risk indices.</p>
+                    </div>
+                    <div>
+                        <button class="btn-primary" onclick="navigateToPage('simulator')">
+                            ⚡ Run Disruption Stress-Test
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 8 Core KPI Cards Grid -->
+                <div class="kpi-8-grid">
+                    <!-- 1. Total Suppliers -->
+                    <div class="kpi-card" id="card-total-suppliers">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="totalSuppliers">Total Suppliers</span>
+                            <div class="kpi-icon-pill cyan">🏢</div>
+                        </div>
+                        <div class="kpi-val" id="val-total-suppliers">248</div>
+                        <span class="kpi-meta-badge success">Tier 1: 64 • Tier 2: 184</span>
+                    </div>
+
+                    <!-- 2. Active Orders -->
+                    <div class="kpi-card" id="card-active-orders">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="activeOrders">Active Orders</span>
+                            <div class="kpi-icon-pill indigo">📦</div>
+                        </div>
+                        <div class="kpi-val" id="val-active-orders">1,842</div>
+                        <span class="kpi-meta-badge success">+12% vs Prev Month</span>
+                    </div>
+
+                    <!-- 3. Inventory Health -->
+                    <div class="kpi-card" id="card-inventory-health">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="inventoryHealth">Inventory Health</span>
+                            <div class="kpi-icon-pill emerald">🛡️</div>
+                        </div>
+                        <div class="kpi-val" id="val-inventory-health">88.5%</div>
+                        <span class="kpi-meta-badge success">Healthy Safety Stock</span>
+                    </div>
+
+                    <!-- 4. Fulfillment Rate -->
+                    <div class="kpi-card" id="card-fulfillment-rate">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="fulfillmentRate">Fulfillment Rate</span>
+                            <div class="kpi-icon-pill cyan">🎯</div>
+                        </div>
+                        <div class="kpi-val" id="val-fulfillment-rate">96.2%</div>
+                        <span class="kpi-meta-badge success">Target > 95.0%</span>
+                    </div>
+
+                    <!-- 5. At-Risk Suppliers -->
+                    <div class="kpi-card" id="card-at-risk-suppliers">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="atRiskSuppliers">At-Risk Suppliers</span>
+                            <div class="kpi-icon-pill rose">⚠️</div>
+                        </div>
+                        <div class="kpi-val" style="color: var(--color-rose);" id="val-at-risk-suppliers">12</div>
+                        <span class="kpi-meta-badge danger">3 Single-Source Nodes</span>
+                    </div>
+
+                    <!-- 6. Supply Chain Risk Score -->
+                    <div class="kpi-card" id="card-risk-score">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="riskScore">Supply Chain Risk Score</span>
+                            <div class="kpi-icon-pill amber">⚡</div>
+                        </div>
+                        <div class="kpi-val" style="color: var(--color-amber);" id="val-risk-score">24.8</div>
+                        <span class="kpi-meta-badge warning">Low/Moderate Composite</span>
+                    </div>
+
+                    <!-- 7. Recovery Time Estimate -->
+                    <div class="kpi-card" id="card-recovery-time">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="recoveryTime">Recovery Time Estimate</span>
+                            <div class="kpi-icon-pill emerald">⏱️</div>
+                        </div>
+                        <div class="kpi-val" style="color: var(--color-emerald);" id="val-recovery-time">4.2d</div>
+                        <span class="kpi-meta-badge success">AI Autonomous Buffer</span>
+                    </div>
+
+                    <!-- 8. Total Logistics Cost (Multi-Currency Converted) -->
+                    <div class="kpi-card" id="card-logistics-cost">
+                        <div class="kpi-top-row">
+                            <span class="kpi-label" data-i18n="logisticsCost">Total Logistics Cost</span>
+                            <div class="kpi-icon-pill cyan">💰</div>
+                        </div>
+                        <div class="kpi-val" style="font-size: 1.6rem;" id="val-logistics-cost">$4.28M</div>
+                        <span class="kpi-meta-badge success" id="val-currency-badge">USD Base Rate</span>
+                    </div>
+                </div>
+
+                <!-- Charts Snapshot Row -->
+                <div class="dash-charts-row">
+                    <div class="content-panel">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="demandVsSupplyTitle">Demand vs Supply Trend Analysis</h3>
+                            <button class="btn-secondary" onclick="navigateToPage('analytics')">View Full Analysis ➔</button>
+                        </div>
+                        <div style="position: relative; height: 280px; width: 100%;">
+                            <canvas id="dashDemandSupplyChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="content-panel">
+                        <div class="panel-title-bar">
+                            <h3>🌐 Sourcing Risk Breakdown</h3>
+                        </div>
+                        <div style="position: relative; height: 280px; width: 100%;">
+                            <canvas id="dashRiskDoughnutChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ============================================================
+                 FEATURE 2: REAL-TIME SUPPLY CHAIN TRACKING
+                 ============================================================ -->
+            <section id="page-tracking" class="page-view">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>📡 <span data-i18n="navTracking">Real-Time Supply Chain Tracking</span></h2>
+                        <p>Live telemetry stream across suppliers, maritime/air shipments, warehouses, inventories, assembly lines, and corridors.</p>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <span style="font-size: 0.8rem; color: var(--text-secondary);">Auto-Refreshing Every 4s:</span>
+                        <span class="pulse-dot"></span>
+                    </div>
+                </div>
+
+                <!-- Status Indicators Legend -->
+                <div class="status-indicators-legend">
+                    <strong style="font-size: 0.82rem; text-transform: uppercase; color: var(--text-muted);">Status Indicators:</strong>
+                    <div class="legend-item">
+                        <span class="badge-dot normal"></span>
+                        <span data-i18n="normal">Normal (Optimal Operations)</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="badge-dot warning"></span>
+                        <span data-i18n="warning">Warning (Requires Monitoring)</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="badge-dot critical"></span>
+                        <span data-i18n="critical">Critical (Immediate Autonomous Mitigation)</span>
+                    </div>
+                </div>
+
+                <!-- 6 Real-time Monitoring Widgets Grid -->
+                <div class="tracking-6-grid">
+                    <!-- 1. Supplier Status -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="supplierStatus">Supplier Status</h3>
+                            <span class="status-badge normal">6 Monitored</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-suppliers"></div>
+                    </div>
+
+                    <!-- 2. Shipment Tracking -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="shipmentTracking">Shipment Tracking</h3>
+                            <span class="status-badge warning">6 In-Transit</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-shipments"></div>
+                    </div>
+
+                    <!-- 3. Warehouse Status -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="warehouseStatus">Warehouse Status</h3>
+                            <span class="status-badge normal">5 Global Hubs</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-warehouses"></div>
+                    </div>
+
+                    <!-- 4. Inventory Levels -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="inventoryLevels">Inventory Levels</h3>
+                            <span class="status-badge critical">Critical SKUs</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-inventory"></div>
+                    </div>
+
+                    <!-- 5. Production Status -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="productionStatus">Production Status</h3>
+                            <span class="status-badge normal">4 Plant Lines</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-production"></div>
+                    </div>
+
+                    <!-- 6. Logistics Status -->
+                    <div class="tracking-widget-card">
+                        <div class="panel-title-bar">
+                            <h3 data-i18n="logisticsStatus">Logistics Status</h3>
+                            <span class="status-badge warning">4 Corridors</span>
+                        </div>
+                        <div class="tracking-list" id="track-list-logistics"></div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ============================================================
+                 FEATURE 3: MULTI-AGENT AI SYSTEM (6 AGENTS)
+                 ============================================================ -->
+            <section id="page-agents" class="page-view">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>🤖 <span data-i18n="navAgents">Multi-Agent AI System</span></h2>
+                        <p>Six specialized cognitive agents collaborating to identify risks, evaluate alternatives, and synthesize recovery directives.</p>
+                    </div>
+                    <button class="btn-primary" onclick="navigateToPage('recommendations')">
+                        🎯 View Final Strategy Plan ➔
+                    </button>
+                </div>
+
+                <!-- 6 Agents Display Grid -->
+                <div class="agents-6-grid">
+                    <!-- Agent 6: Coordinator Agent (Master Orchestrator spanning top) -->
+                    <div class="agent-master-card content-panel" id="agent-card-coordinator">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar" style="background: rgba(245, 158, 11, 0.2); border-color: var(--color-amber);">⚡</div>
+                            <div style="flex: 1;">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <h3 style="font-size: 1.25rem; color: #FFFFFF;" id="agent-name-coordinator">Coordinator Agent</h3>
+                                    <span class="status-badge normal" id="agent-status-coordinator">MASTER ORCHESTRATOR</span>
+                                </div>
+                                <p style="font-size: 0.8rem; color: var(--text-secondary);" id="agent-role-coordinator">
+                                    Combines outputs from all 5 agents and generates the final recovery strategy.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span data-i18n="confidenceLevel">Multi-Agent Consensus Confidence</span>
+                                <span id="agent-conf-val-coordinator" style="color: var(--color-emerald); font-family: var(--font-mono);">96.8%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-coordinator" style="width: 96.8%;"></div>
+                            </div>
+                        </div>
+
+                        <div class="agent-reasoning-box">
+                            <strong>Forensic Synthesis Reasoning:</strong>
+                            <p id="agent-reasoning-coordinator" style="margin-top: 4px;"></p>
+                        </div>
+
+                        <div>
+                            <strong style="font-size: 0.82rem; text-transform: uppercase; color: var(--color-cyan);">Synthesized Final Recovery Directives:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-coordinator" style="margin-top: 6px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Agent 1: Demand Agent -->
+                    <div class="content-panel" id="agent-card-demand">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar">📈</div>
+                            <div>
+                                <h3 id="agent-name-demand">Demand Agent</h3>
+                                <p style="font-size: 0.74rem; color: var(--text-secondary);">Production Consumption Forecaster</p>
+                            </div>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span>Confidence</span>
+                                <span id="agent-conf-val-demand" style="color: var(--color-cyan); font-family: var(--font-mono);">96.5%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-demand" style="width: 96.5%;"></div>
+                            </div>
+                        </div>
+                        <div class="agent-reasoning-box">
+                            <strong>Reasoning:</strong>
+                            <p id="agent-reasoning-demand"></p>
+                        </div>
+                        <div>
+                            <strong style="font-size: 0.76rem; text-transform: uppercase; color: var(--text-muted);">Recommendations:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-demand" style="margin-top: 4px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Agent 2: Inventory Agent -->
+                    <div class="content-panel" id="agent-card-inventory">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar">📦</div>
+                            <div>
+                                <h3 id="agent-name-inventory">Inventory Agent</h3>
+                                <p style="font-size: 0.74rem; color: var(--text-secondary);">Buffer Stock & Runout Analyst</p>
+                            </div>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span>Confidence</span>
+                                <span id="agent-conf-val-inventory" style="color: var(--color-emerald); font-family: var(--font-mono);">98.2%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-inventory" style="width: 98.2%;"></div>
+                            </div>
+                        </div>
+                        <div class="agent-reasoning-box">
+                            <strong>Reasoning:</strong>
+                            <p id="agent-reasoning-inventory"></p>
+                        </div>
+                        <div>
+                            <strong style="font-size: 0.76rem; text-transform: uppercase; color: var(--text-muted);">Recommendations:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-inventory" style="margin-top: 4px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Agent 3: Supplier Risk Agent -->
+                    <div class="content-panel" id="agent-card-supplier">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar">🛡️</div>
+                            <div>
+                                <h3 id="agent-name-supplier">Supplier Risk Agent</h3>
+                                <p style="font-size: 0.74rem; color: var(--text-secondary);">Alternative Sourcing Auditor</p>
+                            </div>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span>Confidence</span>
+                                <span id="agent-conf-val-supplier" style="color: var(--color-indigo); font-family: var(--font-mono);">95.8%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-supplier" style="width: 95.8%;"></div>
+                            </div>
+                        </div>
+                        <div class="agent-reasoning-box">
+                            <strong>Reasoning:</strong>
+                            <p id="agent-reasoning-supplier"></p>
+                        </div>
+                        <div>
+                            <strong style="font-size: 0.76rem; text-transform: uppercase; color: var(--text-muted);">Recommendations:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-supplier" style="margin-top: 4px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Agent 4: Logistics Agent -->
+                    <div class="content-panel" id="agent-card-logistics">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar">✈️</div>
+                            <div>
+                                <h3 id="agent-name-logistics">Logistics Agent</h3>
+                                <p style="font-size: 0.74rem; color: var(--text-secondary);">Multimodal Routing Optimizer</p>
+                            </div>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span>Confidence</span>
+                                <span id="agent-conf-val-logistics" style="color: var(--color-cyan); font-family: var(--font-mono);">97.4%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-logistics" style="width: 97.4%;"></div>
+                            </div>
+                        </div>
+                        <div class="agent-reasoning-box">
+                            <strong>Reasoning:</strong>
+                            <p id="agent-reasoning-logistics"></p>
+                        </div>
+                        <div>
+                            <strong style="font-size: 0.76rem; text-transform: uppercase; color: var(--text-muted);">Recommendations:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-logistics" style="margin-top: 4px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Agent 5: Financial Agent -->
+                    <div class="content-panel" id="agent-card-financial">
+                        <div class="agent-profile-header">
+                            <div class="agent-icon-avatar">💰</div>
+                            <div>
+                                <h3 id="agent-name-financial">Financial Agent</h3>
+                                <p style="font-size: 0.74rem; color: var(--text-secondary);">Cost-Benefit & Margin Protection</p>
+                            </div>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-meta">
+                                <span>Confidence</span>
+                                <span id="agent-conf-val-financial" style="color: var(--color-emerald); font-family: var(--font-mono);">96.0%</span>
+                            </div>
+                            <div class="confidence-progress-track">
+                                <div class="confidence-progress-fill" id="agent-conf-bar-financial" style="width: 96.0%;"></div>
+                            </div>
+                        </div>
+                        <div class="agent-reasoning-box">
+                            <strong>Reasoning:</strong>
+                            <p id="agent-reasoning-financial"></p>
+                        </div>
+                        <div>
+                            <strong style="font-size: 0.76rem; text-transform: uppercase; color: var(--text-muted);">Recommendations:</strong>
+                            <div class="agent-recom-list" id="agent-recom-list-financial" style="margin-top: 4px;"></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ============================================================
+                 FEATURE 4: DISRUPTION SIMULATION CENTER
+                 ============================================================ -->
+            <section id="page-simulator" class="page-view">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>⚡ <span data-i18n="navSimulator">Disruption Simulation Center</span></h2>
+                        <p>Configure disruption scenarios across critical nodes, run multi-agent cognitive simulation, and review recovery directives.</p>
+                    </div>
+                </div>
+
+                <div class="sim-center-split">
+                    <!-- Left: Inputs -->
+                    <div class="content-panel">
+                        <h3 style="margin-bottom: 1.25rem;">🎯 Scenario Parameters</h3>
+                        <form id="disruptionForm" onsubmit="handleRunSimulation(event)">
+                            <!-- 1. Supplier -->
+                            <div class="form-group-item">
+                                <label for="simSelectSupplier">Supplier</label>
+                                <select class="form-control-input" id="simSelectSupplier" onchange="syncSimulatorProductDropdown()">
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <!-- 2. Product -->
+                            <div class="form-group-item">
+                                <label for="simSelectProduct">Product</label>
+                                <select class="form-control-input" id="simSelectProduct">
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <!-- 3. Region -->
+                            <div class="form-group-item">
+                                <label for="simSelectRegion">Region</label>
+                                <select class="form-control-input" id="simSelectRegion">
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <!-- 4. Shutdown Duration -->
+                            <div class="form-group-item">
+                                <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.4rem;">
+                                    <label for="simShutdownDuration">Shutdown Duration</label>
+                                    <span style="font-family: var(--font-mono); font-weight: 800; color: var(--color-cyan);" id="durationDisplayVal">21 Days</span>
+                                </div>
+                                <input type="range" class="form-control-input" id="simShutdownDuration" min="1" max="90" value="21" oninput="document.getElementById('durationDisplayVal').textContent = this.value + ' Days'">
+                            </div>
+
+                            <!-- 5. Transport Mode -->
+                            <div class="form-group-item">
+                                <label for="simSelectTransport">Transport Mode</label>
+                                <select class="form-control-input" id="simSelectTransport">
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <!-- Action Button -->
+                            <button type="submit" class="btn-run-analysis" id="btnRunAiAnalysis">
+                                <span>🤖</span>
+                                <span data-i18n="runAiAnalysis">Run AI Analysis</span>
+                                <span>➔</span>
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Right: Results Panel -->
+                    <div class="content-panel" id="simResultsContainer">
+                        <div class="panel-title-bar">
+                            <h3>🔍 Post-Simulation Intelligence</h3>
+                            <span class="status-badge normal" id="simResultsStatus">AI Consensus Active</span>
+                        </div>
+
+                        <div style="display: flex; flex-direction: column; gap: 1rem;">
+                            <!-- 1. Risk Assessment -->
+                            <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem;">
+                                <strong style="color: var(--color-rose); font-size: 0.84rem; text-transform: uppercase;">1. Risk Assessment</strong>
+                                <div id="simRiskAssessmentContent" style="font-size: 0.84rem; margin-top: 4px; color: var(--text-secondary);"></div>
+                            </div>
+
+                            <!-- 2. Impact Analysis -->
+                            <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem;">
+                                <strong style="color: var(--color-amber); font-size: 0.84rem; text-transform: uppercase;">2. Impact Analysis</strong>
+                                <div id="simImpactAnalysisContent" style="font-size: 0.84rem; margin-top: 4px; color: var(--text-secondary);"></div>
+                            </div>
+
+                            <!-- 3. Business Constraints -->
+                            <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem;">
+                                <strong style="color: var(--color-cyan); font-size: 0.84rem; text-transform: uppercase;">3. Business Constraints</strong>
+                                <ul id="simConstraintsList" style="font-size: 0.82rem; padding-left: 1.2rem; margin-top: 4px; color: var(--text-secondary);"></ul>
+                            </div>
+
+                            <!-- 4. Recovery Plan -->
+                            <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem;">
+                                <strong style="color: var(--color-emerald); font-size: 0.84rem; text-transform: uppercase;">4. Recovery Plan</strong>
+                                <div id="simRecoveryPlanContent" style="font-size: 0.84rem; margin-top: 4px; color: var(--text-primary);"></div>
+                            </div>
+
+                            <!-- 5. Alternative Suppliers -->
+                            <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem;">
+                                <strong style="color: var(--color-indigo); font-size: 0.84rem; text-transform: uppercase;">5. Alternative Suppliers</strong>
+                                <div id="simAlternativeSuppliersContent" style="font-size: 0.82rem; margin-top: 6px;"></div>
+                            </div>
+
+                            <!-- 6. Estimated Recovery Duration -->
+                            <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-md); padding: 1rem; display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <strong style="color: var(--color-emerald); font-size: 0.84rem; text-transform: uppercase;">6. Estimated Recovery Duration</strong>
+                                    <p style="font-size: 0.76rem; color: var(--text-secondary);">Autonomous reallocation and expedited freight delivery</p>
+                                </div>
+                                <span style="font-family: var(--font-mono); font-size: 1.5rem; font-weight: 800; color: var(--color-emerald);" id="simRecoveryDurationVal">3.5 Days</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ============================================================
+                 FEATURE 5: AI RECOMMENDATION ENGINE
+                 ============================================================ -->
+            <section id="page-recommendations" class="page-view">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>🎯 <span data-i18n="navRecommendations">AI Recommendation Engine</span></h2>
+                        <p>Synthesized executive action directives, automated supplier shifts, logistics routing, and production pacing.</p>
+                    </div>
+                    <div style="display: flex; gap: 0.75rem;">
+                        <button class="btn-secondary" onclick="exportExecutiveBrief()">📥 Export Strategic Brief</button>
+                        <button class="btn-primary" onclick="openExecutionModal()">🚀 Authorize & Dispatch PO</button>
+                    </div>
+                </div>
+
+                <!-- 4 Top Hero Directives -->
+                <div class="recom-top-hero-grid">
+                    <!-- 1. Recommended Supplier -->
+                    <div class="recom-hero-tile highlight">
+                        <span class="kpi-label" data-i18n="recommendedSupplier">Recommended Supplier</span>
+                        <div class="kpi-val" style="font-size: 1.35rem; color: var(--color-cyan); margin: 6px 0;" id="recomSupplierTitle">Kyoto Precision Semiconductor Ltd</div>
+                        <div style="font-size: 0.76rem; color: var(--text-muted);" id="recomSupplierSub">Japan • 100% Tooling Validated • 99.2% Reliability</div>
+                    </div>
+
+                    <!-- 2. Estimated Cost Impact -->
+                    <div class="recom-hero-tile">
+                        <span class="kpi-label" data-i18n="estimatedCostImpact">Estimated Cost Impact</span>
+                        <div class="kpi-val" style="color: var(--color-gold); margin: 6px 0;" id="recomCostImpactVal">$48,200</div>
+                        <div style="font-size: 0.76rem; color: var(--text-muted);" id="recomCostSub">Converted into selected currency</div>
+                    </div>
+
+                    <!-- 3. Recovery Time -->
+                    <div class="recom-hero-tile">
+                        <span class="kpi-label" data-i18n="recoveryTime">Recovery Time</span>
+                        <div class="kpi-val" style="color: var(--color-emerald); margin: 6px 0;" id="recomRecoveryTimeVal">3.5 Days</div>
+                        <div style="font-size: 0.76rem; color: var(--text-muted);">SLA-compliant delivery window</div>
+                    </div>
+
+                    <!-- 4. Confidence Level -->
+                    <div class="recom-hero-tile">
+                        <span class="kpi-label" data-i18n="confidenceLevel">Confidence Level</span>
+                        <div class="kpi-val" style="color: var(--color-indigo); margin: 6px 0;" id="recomConfidenceVal">96.8%</div>
+                        <div style="font-size: 0.76rem; color: var(--text-muted);">Unanimous 6-Agent Consensus</div>
+                    </div>
+                </div>
+
+                <!-- 3 Actionable Strategic Plans Grid -->
+                <div class="recom-plans-3-grid">
+                    <!-- Logistics Strategy -->
+                    <div class="recom-plan-card">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
+                                <span style="font-size: 1.3rem;">✈️</span>
+                                <h3 data-i18n="logisticsStrategy" style="font-size: 1.05rem;">Logistics Strategy</h3>
+                            </div>
+                            <p style="font-size: 0.86rem; color: var(--text-secondary); line-height: 1.55;" id="recomLogisticsPlanText">
+                                Hybrid Air/Ocean Freight: 40% express air delivery via Japan cargo hub in 3 days; 60% ocean consolidation in 14 days.
+                            </p>
+                        </div>
+                        <div style="margin-top: 1.5rem; border-top: 1px solid var(--border-subtle); padding-top: 0.75rem;">
+                            <span class="status-badge normal">Priority Route Confirmed</span>
+                        </div>
+                    </div>
+
+                    <!-- Inventory Reallocation Plan -->
+                    <div class="recom-plan-card">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
+                                <span style="font-size: 1.3rem;">📦</span>
+                                <h3 data-i18n="inventoryPlan" style="font-size: 1.05rem;">Inventory Reallocation Plan</h3>
+                            </div>
+                            <p style="font-size: 0.86rem; color: var(--text-secondary); line-height: 1.55;" id="recomInventoryPlanText">
+                                Transfer 2,200 units from Chicago Central Hub to Detroit Plant; reduce buffer threshold temporarily to 8%.
+                            </p>
+                        </div>
+                        <div style="margin-top: 1.5rem; border-top: 1px solid var(--border-subtle); padding-top: 0.75rem;">
+                            <span class="status-badge normal">Internal Transfer Approved</span>
+                        </div>
+                    </div>
+
+                    <!-- Production Rescheduling Plan -->
+                    <div class="recom-plan-card">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
+                                <span style="font-size: 1.3rem;">🏭</span>
+                                <h3 data-i18n="productionPlan" style="font-size: 1.05rem;">Production Rescheduling Plan</h3>
+                            </div>
+                            <p style="font-size: 0.86rem; color: var(--text-secondary); line-height: 1.55;" id="recomProductionPlanText">
+                                Pace Assembly Line C to 88% takt speed across 10 days; prioritize OEM batches 408 & 412; zero assembly shutdowns.
+                            </p>
+                        </div>
+                        <div style="margin-top: 1.5rem; border-top: 1px solid var(--border-subtle); padding-top: 0.75rem;">
+                            <span class="status-badge normal">Line Schedule Synchronized</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ============================================================
+                 FEATURE 6: DEMAND VS SUPPLY ANALYTICS
+                 ============================================================ -->
+            <section id="page-analytics" class="page-view">
+                <div class="page-header">
+                    <div class="page-header-titles">
+                        <h2>📈 <span data-i18n="navAnalytics">Demand vs Supply Analytics</span></h2>
+                        <p>12-month historical trends, forward forecasting, seasonal shortfall detection, and material flow prediction.</p>
+                    </div>
+                </div>
+
+                <!-- Shortage Alert Banner (Displayed whenever supply falls below demand) -->
+                <div class="shortage-predicted-alert" id="shortageAlertBanner">
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <span style="font-size: 1.8rem;">⚠️</span>
+                        <div>
+                            <strong style="color: #FFFFFF; font-size: 1rem;" data-i18n="supplyShortagePredicted">Supply Shortage Predicted</strong>
+                            <p style="font-size: 0.84rem; color: #FECACA;" id="shortageDetailsText">
+                                Q3-Q4 Supply deficit detected: Projected shortfall of 4,700 units between September and November.
+                            </p>
+                        </div>
+                    </div>
+                    <button class="btn-primary" style="background: #EF4444;" onclick="navigateToPage('recommendations')">
+                        Deploy AI Mitigation ➔
+                    </button>
+                </div>
+
+                <!-- Main Line Chart Panel -->
+                <div class="content-panel">
+                    <div class="panel-title-bar">
+                        <h3 data-i18n="demandVsSupplyTitle">Demand vs Supply Trend Analysis</h3>
+                        <div style="display: flex; gap: 1rem; font-size: 0.8rem; font-weight: 700;">
+                            <span style="color: #38BDF8;">● Blue Line = Demand</span>
+                            <span style="color: #10B981;">● Green Line = Supply</span>
+                        </div>
+                    </div>
+                    <div style="position: relative; height: 380px; width: 100%;">
+                        <canvas id="mainDemandSupplyChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- 3 Forecast Cards (Demand Forecast, Inventory Forecast, Supply Forecast) -->
+                <div class="forecast-3-grid">
+                    <!-- Demand Forecast -->
+                    <div class="forecast-stat-card">
+                        <span class="kpi-label" data-i18n="demandForecast">Demand Forecast</span>
+                        <div class="kpi-val" style="color: #38BDF8; font-size: 1.7rem; margin: 4px 0;" id="val-demand-forecast">86,500 Units</div>
+                        <p style="font-size: 0.78rem; color: var(--text-secondary);">Projected OEM requirement across Q3-Q4 (+18.4% YoY)</p>
+                    </div>
+
+                    <!-- Inventory Forecast -->
+                    <div class="forecast-stat-card">
+                        <span class="kpi-label" data-i18n="inventoryForecast">Inventory Forecast</span>
+                        <div class="kpi-val" style="color: var(--color-indigo); font-size: 1.7rem; margin: 4px 0;" id="val-inv-forecast">48,200 Units</div>
+                        <p style="font-size: 0.78rem; color: var(--text-secondary);">Expected warehouse buffer with current re-order cycles</p>
+                    </div>
+
+                    <!-- Supply Forecast -->
+                    <div class="forecast-stat-card">
+                        <span class="kpi-label" data-i18n="supplyForecast">Supply Forecast</span>
+                        <div class="kpi-val" style="color: #10B981; font-size: 1.7rem; margin: 4px 0;" id="val-supply-forecast">74,000 Units</div>
+                        <p style="font-size: 0.78rem; color: var(--text-secondary);">Confirmed vendor output prior to autonomous mitigation</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer style="border-top: 1px solid var(--border-subtle); padding: 1.25rem 2rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-muted); font-size: 0.8rem; flex-wrap: wrap; gap: 0.5rem;">
+            <div>
+                <strong>Prabandhana AI</strong> • Enterprise Multi-Agent Supply Chain Resilience Operations
+            </div>
+            <div>
+                Multi-Language (18) • Multi-Currency (10) • Autonomous Recovery System
+            </div>
+        </footer>
+    </div>
+
+    <!-- Modal: Authorize & Dispatch PO -->
+    <div class="modal-backdrop" id="executionModal">
+        <div class="modal-box">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+                <h3 style="font-size: 1.25rem; font-weight: 800; color: var(--text-primary);">🚀 Confirm Autonomous Recovery PO</h3>
+                <button onclick="closeExecutionModal()" style="background: none; border: none; font-size: 1.4rem; color: var(--text-muted); cursor: pointer;">&times;</button>
+            </div>
+            <div style="font-size: 0.88rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: 1.5rem;">
+                <p>Authorize immediate emergency dispatch to <strong style="color: var(--color-cyan);" id="modalSupplierName">Kyoto Precision Semiconductor Ltd</strong>.</p>
+                <div style="background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1rem; margin: 1rem 0;">
+                    <ul style="padding-left: 1.25rem; display: flex; flex-direction: column; gap: 0.35rem; color: var(--text-primary); font-size: 0.82rem;">
+                        <li>Release Emergency PO-88402 via SAP / Oracle ERP Gateway</li>
+                        <li>Reserve Priority Air Freight slot with Nagoya Airport cargo logistics</li>
+                        <li>Initiate Chicago-to-Detroit inventory buffer transfer</li>
+                        <li>Recalibrate Plant Line C takt speed to 88%</li>
+                    </ul>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.84rem;">
+                    <span>Budget Commitment: <strong style="color: var(--color-gold);" id="modalBudgetVal">$48,200</strong></span>
+                    <span>Expected Recovery: <strong style="color: var(--color-emerald);" id="modalRecoveryVal">3.5 Days</strong></span>
+                </div>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
+                <button class="btn-secondary" onclick="closeExecutionModal()">Cancel</button>
+                <button class="btn-primary" onclick="confirmDispatchAction()">✓ Authorize & Execute</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="app-toast-box" id="appToast">
+        <span style="font-size: 1.2rem;">⚡</span>
+        <span id="toastMessage">Prabandhana AI initialized.</span>
+    </div>
+
+    <!-- Scripts -->
+    <script src="currency.js"></script>
+    <script src="i18n.js"></script>
+    <script src="data.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
+/* Prabandhana AI - Enterprise Design System (Dark/Light Responsive) */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+    /* Base Dark Theme (Default) */
+    --bg-base: #070B13;
+    --bg-surface: #0E1626;
+    --bg-card: rgba(18, 28, 48, 0.85);
+    --bg-card-hover: rgba(26, 40, 70, 0.95);
+    --bg-glass: rgba(14, 22, 38, 0.75);
+    --bg-subtle: rgba(255, 255, 255, 0.03);
+
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-accent: rgba(6, 182, 212, 0.35);
+    --border-glow: rgba(99, 102, 241, 0.35);
+
+    --text-primary: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --text-muted: #64748B;
+    --text-accent: #38BDF8;
+
+    --color-cyan: #06B6D4;
+    --color-cyan-glow: rgba(6, 182, 212, 0.25);
+    --color-indigo: #6366F1;
+    --color-indigo-glow: rgba(99, 102, 241, 0.25);
+    --color-emerald: #10B981;
+    --color-emerald-glow: rgba(16, 185, 129, 0.2);
+    --color-amber: #F59E0B;
+    --color-amber-glow: rgba(245, 158, 11, 0.2);
+    --color-rose: #EF4444;
+    --color-rose-glow: rgba(239, 68, 68, 0.25);
+    --color-gold: #FBBF24;
+
+    --font-main: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 20px;
+
+    --shadow-card: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+    --shadow-glow: 0 0 20px -3px var(--color-cyan-glow);
+
+    --transition-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-normal: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Light Mode Overrides */
+[data-theme="light"] {
+    --bg-base: #F1F5F9;
+    --bg-surface: #FFFFFF;
+    --bg-card: rgba(255, 255, 255, 0.95);
+    --bg-card-hover: #FFFFFF;
+    --bg-glass: rgba(255, 255, 255, 0.85);
+    --bg-subtle: rgba(0, 0, 0, 0.02);
+
+    --border-subtle: rgba(226, 232, 240, 0.9);
+    --border-accent: rgba(6, 182, 212, 0.5);
+    --border-glow: rgba(99, 102, 241, 0.3);
+
+    --text-primary: #0F172A;
+    --text-secondary: #475569;
+    --text-muted: #94A3B8;
+    --text-accent: #0284C7;
+
+    --shadow-card: 0 10px 20px -5px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background-color: var(--bg-base);
+    background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.1) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(6, 182, 212, 0.1) 0px, transparent 50%),
+        radial-gradient(at 50% 100%, rgba(14, 22, 38, 0.4) 0px, transparent 60%);
+    background-attachment: fixed;
+    color: var(--text-primary);
+    font-family: var(--font-main);
+    line-height: 1.5;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    transition: background-color var(--transition-normal), color var(--transition-normal);
+}
+
+/* RTL Support */
+[dir="rtl"] {
+    direction: rtl;
+    text-align: right;
+}
+
+[dir="rtl"] .brand-section {
+    flex-direction: row-reverse;
+}
+
+[dir="rtl"] .top-bar-controls {
+    flex-direction: row-reverse;
+}
+
+/* App Wrapper */
+.app-wrapper {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* ============================================================
+   TOP NAVIGATION BAR & CONTROLS
+   ============================================================ */
+.top-navbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    background: var(--bg-glass);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0.75rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.brand-section {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.brand-logo-icon {
+    width: 44px;
+    height: 44px;
+    background: linear-gradient(135deg, #06B6D4 0%, #6366F1 50%, #8B5CF6 100%);
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-size: 1.4rem;
+    font-weight: 800;
+    box-shadow: 0 0 20px rgba(6, 182, 212, 0.5);
+    animation: iconPulse 4s infinite ease-in-out;
+}
+
+@keyframes iconPulse {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 15px rgba(6, 182, 212, 0.4); }
+    50% { transform: scale(1.05); box-shadow: 0 0 25px rgba(99, 102, 241, 0.6); }
+}
+
+.brand-title-wrap h1 {
+    font-size: 1.25rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.brand-title-wrap h1 span {
+    font-size: 0.7rem;
+    font-weight: 700;
+    background: rgba(6, 182, 212, 0.15);
+    color: var(--color-cyan);
+    border: 1px solid rgba(6, 182, 212, 0.35);
+    padding: 2px 8px;
+    border-radius: 9999px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.brand-subtitle {
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+    max-width: 420px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Navigation Tabs */
+.nav-tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: var(--bg-subtle);
+    padding: 4px;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle);
+    overflow-x: auto;
+}
+
+.nav-tab-btn {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-secondary);
+    padding: 8px 14px;
+    border-radius: var(--radius-md);
+    font-size: 0.84rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    white-space: nowrap;
+}
+
+.nav-tab-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.nav-tab-btn.active {
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.2), rgba(99, 102, 241, 0.25));
+    color: var(--text-primary);
+    border: 1px solid var(--border-accent);
+    box-shadow: 0 0 15px rgba(6, 182, 212, 0.2);
+}
+
+/* Top Bar Controls (Language, Currency, Theme, Live Ticker) */
+.top-bar-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    flex-wrap: wrap;
+}
+
+.ctrl-select {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 6px 10px;
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+.ctrl-select:focus {
+    border-color: var(--color-cyan);
+    box-shadow: 0 0 10px rgba(6, 182, 212, 0.3);
+}
+
+.ctrl-select option {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+}
+
+.btn-theme-toggle {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 6px 12px;
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.btn-theme-toggle:hover {
+    border-color: var(--color-cyan);
+}
+
+.live-pill {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: var(--color-emerald);
+    font-size: 0.76rem;
+    font-weight: 700;
+    padding: 6px 12px;
+    border-radius: 9999px;
+    font-family: var(--font-mono);
+}
+
+.pulse-dot {
+    width: 8px;
+    height: 8px;
+    background-color: var(--color-emerald);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--color-emerald);
+    animation: pulseGlow 1.8s infinite;
+}
+
+@keyframes pulseGlow {
+    0% { transform: scale(0.9); opacity: 0.8; }
+    50% { transform: scale(1.3); opacity: 1; box-shadow: 0 0 12px var(--color-emerald); }
+    100% { transform: scale(0.9); opacity: 0.8; }
+}
+
+/* ============================================================
+   MAIN VIEWPORT & PAGE LAYOUTS
+   ============================================================ */
+.main-viewport {
+    flex: 1;
+    max-width: 1640px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 1.75rem 2rem;
+}
+
+.page-view {
+    display: none;
+    animation: fadeInView 0.25s ease-out forwards;
+}
+
+.page-view.active {
+    display: block;
+}
+
+@keyframes fadeInView {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Page Header */
+.page-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    margin-bottom: 1.75rem;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+.page-header-titles h2 {
+    font-size: 1.75rem;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.page-header-titles p {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-top: 0.25rem;
+}
+
+/* Buttons */
+.btn-primary {
+    background: linear-gradient(135deg, var(--color-cyan) 0%, var(--color-indigo) 100%);
+    border: none;
+    color: #FFFFFF;
+    padding: 10px 20px;
+    border-radius: var(--radius-md);
+    font-size: 0.88rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: var(--transition-normal);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    box-shadow: 0 4px 15px rgba(6, 182, 212, 0.35);
+}
+
+.btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 22px rgba(6, 182, 212, 0.5);
+}
+
+.btn-secondary {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 8px 16px;
+    border-radius: var(--radius-md);
+    font-size: 0.84rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.btn-secondary:hover {
+    border-color: var(--color-cyan);
+}
+
+/* ============================================================
+   FEATURE 1: DASHBOARD (8 KPI CARDS & ANALYTICS)
+   ============================================================ */
+.kpi-8-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.25rem;
+    margin-bottom: 2rem;
+}
+
+.kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 1.35rem;
+    backdrop-filter: blur(12px);
+    box-shadow: var(--shadow-card);
+    transition: var(--transition-normal);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.kpi-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--border-accent);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.3), 0 0 15px rgba(6, 182, 212, 0.15);
+}
+
+.kpi-top-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 0.75rem;
+}
+
+.kpi-label {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.kpi-icon-pill {
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+}
+
+.kpi-icon-pill.cyan { background: rgba(6, 182, 212, 0.15); color: var(--color-cyan); border: 1px solid rgba(6, 182, 212, 0.3); }
+.kpi-icon-pill.indigo { background: rgba(99, 102, 241, 0.15); color: var(--color-indigo); border: 1px solid rgba(99, 102, 241, 0.3); }
+.kpi-icon-pill.emerald { background: rgba(16, 185, 129, 0.15); color: var(--color-emerald); border: 1px solid rgba(16, 185, 129, 0.3); }
+.kpi-icon-pill.rose { background: rgba(239, 68, 68, 0.15); color: var(--color-rose); border: 1px solid rgba(239, 68, 68, 0.3); }
+.kpi-icon-pill.amber { background: rgba(245, 158, 11, 0.15); color: var(--color-amber); border: 1px solid rgba(245, 158, 11, 0.3); }
+
+.kpi-val {
+    font-size: 2rem;
+    font-weight: 800;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    letter-spacing: -0.03em;
+}
+
+.kpi-meta-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    margin-top: 0.4rem;
+}
+
+.kpi-meta-badge.success { background: rgba(16, 185, 129, 0.15); color: var(--color-emerald); }
+.kpi-meta-badge.warning { background: rgba(245, 158, 11, 0.15); color: var(--color-amber); }
+.kpi-meta-badge.danger { background: rgba(239, 68, 68, 0.15); color: var(--color-rose); }
+
+/* Dashboard Chart Row */
+.dash-charts-row {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.content-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem;
+    box-shadow: var(--shadow-card);
+    display: flex;
+    flex-direction: column;
+}
+
+.panel-title-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.25rem;
+}
+
+.panel-title-bar h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* ============================================================
+   FEATURE 2: REAL-TIME SUPPLY CHAIN TRACKING
+   ============================================================ */
+.status-indicators-legend {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    padding: 10px 18px;
+    border-radius: var(--radius-md);
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+/* Status Badges */
+.badge-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.badge-dot.normal { background: var(--color-emerald); box-shadow: 0 0 8px var(--color-emerald); }
+.badge-dot.warning { background: var(--color-amber); box-shadow: 0 0 8px var(--color-amber); }
+.badge-dot.critical { background: var(--color-rose); box-shadow: 0 0 8px var(--color-rose); }
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+}
+
+.status-badge.normal { background: rgba(16, 185, 129, 0.15); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.3); }
+.status-badge.warning { background: rgba(245, 158, 11, 0.15); color: #FBBF24; border: 1px solid rgba(245, 158, 11, 0.3); }
+.status-badge.critical { background: rgba(239, 68, 68, 0.15); color: #F87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+/* 6 Realtime Modules Grid */
+.tracking-6-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.tracking-widget-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 1.25rem;
+    box-shadow: var(--shadow-card);
+    transition: var(--transition-normal);
+    display: flex;
+    flex-direction: column;
+}
+
+.tracking-widget-card:hover {
+    border-color: var(--border-accent);
+}
+
+.tracking-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.tracking-item-row {
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: var(--transition-fast);
+}
+
+.tracking-item-row:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.tracking-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.tracking-item-title {
+    font-size: 0.86rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.tracking-item-desc {
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+}
+
+/* ============================================================
+   FEATURE 3: MULTI-AGENT AI SYSTEM (6 AGENTS)
+   ============================================================ */
+.agents-6-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.agent-master-card {
+    grid-column: span 3;
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.12) 0%, rgba(99, 102, 241, 0.18) 50%, rgba(245, 158, 11, 0.12) 100%);
+    border: 1px solid var(--color-cyan);
+    box-shadow: 0 0 30px rgba(6, 182, 212, 0.2);
+}
+
+.agent-profile-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.25rem;
+}
+
+.agent-icon-avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+}
+
+.confidence-bar-wrap {
+    margin: 1rem 0;
+}
+
+.confidence-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.confidence-progress-track {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.confidence-progress-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--color-cyan), var(--color-emerald));
+    transition: width 0.6s ease;
+}
+
+.agent-reasoning-box {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 10px 14px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    line-height: 1.45;
+    margin-bottom: 1rem;
+}
+
+.agent-recom-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+}
+
+.agent-recom-bullet {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    color: var(--text-primary);
+}
+
+.agent-recom-bullet-icon {
+    color: var(--color-cyan);
+    font-weight: 700;
+}
+
+/* ============================================================
+   FEATURE 4: DISRUPTION SIMULATION CENTER
+   ============================================================ */
+.sim-center-split {
+    display: grid;
+    grid-template-columns: 1fr 1.35fr;
+    gap: 2rem;
+    margin-bottom: 2rem;
+}
+
+.form-group-item {
+    margin-bottom: 1.25rem;
+}
+
+.form-group-item label {
+    display: block;
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 0.45rem;
+}
+
+.form-control-input {
+    width: 100%;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 10px 14px;
+    color: var(--text-primary);
+    font-size: 0.88rem;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+.form-control-input:focus {
+    border-color: var(--color-cyan);
+    box-shadow: 0 0 12px rgba(6, 182, 212, 0.3);
+}
+
+/* Big Action Button */
+.btn-run-analysis {
+    width: 100%;
+    background: linear-gradient(135deg, #06B6D4 0%, #6366F1 50%, #8B5CF6 100%);
+    border: none;
+    color: #FFFFFF;
+    padding: 15px 24px;
+    border-radius: var(--radius-lg);
+    font-size: 1.05rem;
+    font-weight: 800;
+    cursor: pointer;
+    transition: var(--transition-normal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+    box-shadow: 0 4px 25px rgba(99, 102, 241, 0.45);
+}
+
+.btn-run-analysis:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(99, 102, 241, 0.65);
+}
+
+/* ============================================================
+   FEATURE 5: AI RECOMMENDATION ENGINE VIEW
+   ============================================================ */
+.recom-top-hero-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.25rem;
+    margin-bottom: 2rem;
+}
+
+.recom-hero-tile {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 1.35rem;
+    box-shadow: var(--shadow-card);
+}
+
+.recom-hero-tile.highlight {
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.15), rgba(99, 102, 241, 0.2));
+    border-color: var(--color-cyan);
+}
+
+.recom-plans-3-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.recom-plan-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem;
+    box-shadow: var(--shadow-card);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+/* ============================================================
+   FEATURE 6: DEMAND VS SUPPLY ANALYTICS
+   ============================================================ */
+.shortage-predicted-alert {
+    background: linear-gradient(90deg, rgba(239, 68, 68, 0.2), rgba(245, 158, 11, 0.15));
+    border: 1px solid var(--color-rose);
+    border-radius: var(--radius-md);
+    padding: 1rem 1.5rem;
+    margin-bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    animation: alertBorderPulse 2.5s infinite;
+}
+
+@keyframes alertBorderPulse {
+    0%, 100% { border-color: rgba(239, 68, 68, 0.4); }
+    50% { border-color: rgba(239, 68, 68, 1); box-shadow: 0 0 20px rgba(239, 68, 68, 0.25); }
+}
+
+.forecast-3-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+    margin-top: 1.5rem;
+}
+
+.forecast-stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 1.25rem;
+}
+
+/* Custom Table */
+.custom-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.84rem;
+}
+
+.custom-table th {
+    text-align: left;
+    padding: 10px 14px;
+    color: var(--text-secondary);
+    font-weight: 700;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: var(--bg-subtle);
+}
+
+.custom-table td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    vertical-align: middle;
+}
+
+.custom-table tr:hover td {
+    background: var(--bg-subtle);
+}
+
+/* Toast Notification */
+.app-toast-box {
+    position: fixed;
+    bottom: 2rem;
+    right: 2rem;
+    background: #0F172A;
+    border: 1px solid var(--color-cyan);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 20px rgba(6, 182, 212, 0.3);
+    border-radius: var(--radius-md);
+    padding: 12px 20px;
+    color: #FFFFFF;
+    font-size: 0.88rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    z-index: 2000;
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+}
+
+.app-toast-box.show {
+    transform: translateY(0);
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* Modal */
+.modal-backdrop {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+}
+
+.modal-backdrop.active {
+    display: flex;
+}
+
+.modal-box {
+    background: var(--bg-surface);
+    border: 1px solid var(--color-cyan);
+    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.8), 0 0 35px rgba(6, 182, 212, 0.25);
+    border-radius: var(--radius-xl);
+    max-width: 650px;
+    width: 100%;
+    padding: 2rem;
+    animation: popModal 0.25s ease-out;
+}
+
+@keyframes popModal {
+    from { transform: scale(0.92); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+}
+
+/* Responsive Breakpoints */
+@media (max-width: 1300px) {
+    .kpi-8-grid { grid-template-columns: repeat(2, 1fr); }
+    .tracking-6-grid, .agents-6-grid, .recom-plans-3-grid, .forecast-3-grid { grid-template-columns: 1fr; }
+    .agent-master-card { grid-column: span 1; }
+    .dash-charts-row, .sim-center-split { grid-template-columns: 1fr; }
+    .recom-top-hero-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 768px) {
+    .top-navbar { padding: 0.75rem 1rem; }
+    .nav-tabs { width: 100%; justify-content: flex-start; }
+    .main-viewport { padding: 1rem; }
+    .kpi-8-grid, .recom-top-hero-grid { grid-template-columns: 1fr; }
+    .top-bar-controls { width: 100%; justify-content: space-between; }
+}
